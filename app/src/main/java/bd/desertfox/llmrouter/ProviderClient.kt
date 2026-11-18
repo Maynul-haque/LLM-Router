@@ -1,30 +1,49 @@
 package bd.desertfox.llmrouter
 
 import org.json.JSONObject
+import java.io.ByteArrayOutputStream
 import java.io.InputStream
 import java.net.HttpURLConnection
 import java.net.URL
 
 object ProviderClient {
+    private const val MAX_CHAT_RESPONSE_BYTES = 8 * 1024 * 1024
+    private const val MAX_MODELS_RESPONSE_BYTES = 1024 * 1024
+
+    /** Read at most [cap] bytes; throws RuntimeException("response too large") if exceeded. */
+    private fun readBounded(ins: InputStream, cap: Int): ByteArray {
+        val out = ByteArrayOutputStream()
+        val buf = ByteArray(8192)
+        var total = 0
+        while (true) {
+            val n = ins.read(buf)
+            if (n < 0) break
+            total += n
+            if (total > cap) throw RuntimeException("response too large")
+            out.write(buf, 0, n)
+        }
+        return out.toByteArray()
+    }
+
     fun listModels(p: JSONObject): List<String> {
         val c = URL(p.optString("baseUrl") + "/models").openConnection() as HttpURLConnection
         c.connectTimeout = 15000
         c.readTimeout = 30000
         c.setRequestProperty("Authorization", "Bearer " + p.optString("apiKey"))
-        try {
-            val code = c.responseCode
-            if (code != 200) throw RuntimeException("HTTP " + code)
-            val body = c.inputStream.bufferedReader().readText()
-            val j = JSONObject(body)
-            val data = j.optJSONArray("data") ?: throw RuntimeException("no data[] in response")
-            val out = ArrayList<String>()
-            for (i in 0 until data.length()) {
-                val m = data.optJSONObject(i) ?: continue
-                val id = m.optString("id")
-                if (id.isNotBlank()) out.add(id)
-            }
-            return out
-        } finally { c.disconnect() }
+        // No disconnect() here on purpose: letting HttpURLConnection keep
+        // the connection alive lets the next request reuse it.
+        val code = c.responseCode
+        if (code != 200) throw RuntimeException("HTTP " + code)
+        val body = readBounded(c.inputStream, MAX_MODELS_RESPONSE_BYTES)
+        val j = JSONObject(String(body, Charsets.UTF_8))
+        val data = j.optJSONArray("data") ?: throw RuntimeException("no data[] in response")
+        val out = ArrayList<String>()
+        for (i in 0 until data.length()) {
+            val m = data.optJSONObject(i) ?: continue
+            val id = m.optString("id")
+            if (id.isNotBlank()) out.add(id)
+        }
+        return out
     }
 
     class ChatResult(val status: Int, val contentType: String,
@@ -41,7 +60,19 @@ object ProviderClient {
         c.setRequestProperty("Authorization", "Bearer " + p.optString("apiKey"))
         c.setRequestProperty("Content-Type", "application/json")
         c.setRequestProperty("Accept", if (stream) "text/event-stream" else "application/json")
-        val body = JSONObject(reqBody.toString())
+        // Cheap shallow copy (no re-parse of the whole body): the same
+        // reqBody is passed for every provider in the fallback chain, so
+        // it must never be mutated — only the copy gets "model" set.
+        // Cheap shallow copy (no toString() re-parse, no mutation of the
+        // caller's object — it is shared across the fallback chain).
+        // keys() exists in both Android's org.json and org.json-java;
+        // the static getNames() does not exist in Android's fork.
+        val body = JSONObject()
+        val it = reqBody.keys()
+        while (it.hasNext()) {
+            val k = it.next()
+            body.put(k, reqBody.opt(k))
+        }
         body.put("model", model)
         val bytes = body.toString().toByteArray(Charsets.UTF_8)
         c.setFixedLengthStreamingMode(bytes.size)
@@ -51,9 +82,16 @@ object ProviderClient {
         val ct = c.contentType ?: "application/json"
         if (code in 200..299) {
             return if (stream) ChatResult(code, ct, null, c.inputStream)
-            else ChatResult(code, ct, c.inputStream.readBytes(), null)
+            else try {
+                ChatResult(code, ct, readBounded(c.inputStream, MAX_CHAT_RESPONSE_BYTES), null)
+            } catch (e: RuntimeException) {
+                c.disconnect()
+                throw e
+            }
         }
-        val err = try { c.errorStream?.bufferedReader()?.readText() ?: "" } catch (e: Exception) { "" }
+        val err = try {
+            c.errorStream?.let { readBounded(it, MAX_CHAT_RESPONSE_BYTES) }?.toString(Charsets.UTF_8) ?: ""
+        } catch (e: Exception) { "" }
         c.disconnect()
         return ChatResult(code, ct, err.toByteArray(Charsets.UTF_8), null)
     }

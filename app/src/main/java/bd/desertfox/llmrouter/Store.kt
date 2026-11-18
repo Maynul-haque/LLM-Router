@@ -31,6 +31,7 @@ object Store {
         val f = File(ctx.filesDir, "config.json")
         cfg = try { if (f.exists()) JSONObject(f.readText()) else JSONObject() } catch (e: Exception) { JSONObject() }
         defaults()
+        invalidateIndexes()
         synchronized(log) {
             log.clear()
             val la = cfg.optJSONArray("log") ?: JSONArray()
@@ -105,19 +106,68 @@ object Store {
 
     fun providers(): JSONArray = cfg.optJSONArray("providers") ?: JSONArray()
 
-    fun providerByName(n: String): JSONObject? {
-        val ps = providers()
-        for (i in 0 until ps.length()) {
-            val p = ps.getJSONObject(i)
-            if (p.optString("name") == n) return p
-        }
-        return null
+    // Lazily-built O(1) indexes. Each is a single O(n) scan rebuilt on
+    // next use after any mutation that can change its keys (see
+    // invalidateIndexes()); lookups between mutations are O(1).
+    private var providerIndex: HashMap<String, JSONObject>? = null
+    private var modelIndex: HashMap<String, JSONObject>? = null
+    private var comboIndex: HashMap<String, JSONObject>? = null
+
+    private fun invalidateIndexes() {
+        providerIndex = null
+        modelIndex = null
+        comboIndex = null
     }
+
+    private fun providersByName(): HashMap<String, JSONObject> {
+        var idx = providerIndex
+        if (idx == null) {
+            idx = HashMap()
+            val ps = providers()
+            for (i in 0 until ps.length()) {
+                val p = ps.getJSONObject(i)
+                idx[p.optString("name")] = p
+            }
+            providerIndex = idx
+        }
+        return idx
+    }
+
+    private fun modelsByKey(): HashMap<String, JSONObject> {
+        var idx = modelIndex
+        if (idx == null) {
+            idx = HashMap()
+            val ms = models()
+            for (i in 0 until ms.length()) {
+                val m = ms.getJSONObject(i)
+                idx[m.optString("provider") + "|" + m.optString("id")] = m
+            }
+            modelIndex = idx
+        }
+        return idx
+    }
+
+    private fun combosByName(): HashMap<String, JSONObject> {
+        var idx = comboIndex
+        if (idx == null) {
+            idx = HashMap()
+            val cs = combos()
+            for (i in 0 until cs.length()) {
+                val c = cs.getJSONObject(i)
+                idx[c.optString("name")] = c
+            }
+            comboIndex = idx
+        }
+        return idx
+    }
+
+    fun providerByName(n: String): JSONObject? = providersByName()[n]
 
     fun addProvider(name: String, baseUrl: String, apiKey: String): Boolean {
         if (name.isBlank() || baseUrl.isBlank() || providerByName(name) != null) return false
         providers().put(JSONObject().put("name", name).put("baseUrl", baseUrl.trimEnd('/'))
             .put("apiKey", apiKey).put("enabled", true))
+        invalidateIndexes()
         save()
         return true
     }
@@ -153,19 +203,13 @@ object Store {
             val ids = cfg.optJSONObject("active")?.optJSONArray("models")
             if (ids != null && ids.length() > 0 && ids.optString(0).startsWith(name + "|")) clearActive()
         }
+        invalidateIndexes()
         save()
     }
 
     fun models(): JSONArray = cfg.optJSONArray("models") ?: JSONArray()
 
-    fun findModel(key: String): JSONObject? {
-        val ms = models()
-        for (i in 0 until ms.length()) {
-            val m = ms.getJSONObject(i)
-            if (m.optString("provider") + "|" + m.optString("id") == key) return m
-        }
-        return null
-    }
+    fun findModel(key: String): JSONObject? = modelsByKey()[key]
 
     fun enabledChain(): List<Pair<JSONObject, String>> {
         val out = ArrayList<Pair<JSONObject, String>>()
@@ -270,18 +314,12 @@ object Store {
         return cfg.getJSONArray("combos")
     }
 
-    fun comboByName(n: String): JSONObject? {
-        val cs = combos()
-        for (i in 0 until cs.length()) {
-            val c = cs.getJSONObject(i)
-            if (c.optString("name") == n) return c
-        }
-        return null
-    }
+    fun comboByName(n: String): JSONObject? = combosByName()[n]
 
     fun addCombo(n: String): Boolean {
         if (n.isBlank() || comboByName(n) != null) return false
         combos().put(JSONObject().put("name", n).put("models", JSONArray()))
+        invalidateIndexes()
         save()
         return true
     }
@@ -295,6 +333,7 @@ object Store {
         }
         cfg.put("combos", keep)
         if (activeComboName() == n) clearActive()
+        invalidateIndexes()
         save()
     }
 
@@ -303,6 +342,7 @@ object Store {
         val c = comboByName(old) ?: return false
         c.put("name", new)
         if (activeComboName() == old) cfg.getJSONObject("active").put("name", new)
+        invalidateIndexes()
         save()
         return true
     }
@@ -430,6 +470,7 @@ object Store {
             if (!have) { km.put(JSONObject().put("provider", providerName).put("id", id).put("enabled", true)); added++ }
         }
         cfg.put("models", km)
+        invalidateIndexes()
         save()
         return Pair(added, removed)
     }
@@ -458,6 +499,7 @@ object Store {
     fun setProviderEnabled(name: String, enabled: Boolean) {
         val p = providerByName(name) ?: return
         p.put("enabled", enabled)
+        invalidateIndexes()
         save()
     }
 
@@ -488,6 +530,7 @@ object Store {
                 if (k.startsWith(old + "|")) ids.put(j, new + "|" + k.substringAfter("|"))
             }
         }
+        invalidateIndexes()
         save()
         return true
     }

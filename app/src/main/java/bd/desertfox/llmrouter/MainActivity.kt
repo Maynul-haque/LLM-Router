@@ -13,7 +13,6 @@ import android.os.Build
 import android.os.Bundle
 import android.text.Editable
 import android.text.TextWatcher
-import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
 import android.widget.AbsListView
@@ -33,6 +32,8 @@ class MainActivity : Activity() {
     private val BACKUP_REQ = 12
     private val modelKeys = ArrayList<String>()
     private val modelIndex = HashMap<String, JSONObject>()
+    private var cachedSortedKeys: List<String>? = null
+    private var sortedKeysDirty = true
     private val provCounts = HashMap<String, Int>()
     private var modelQuery = ""
     private var curTab = 0
@@ -44,7 +45,6 @@ class MainActivity : Activity() {
     private val BG = 0xFF0D0D11.toInt()
     private val CARD = 0xFF1B1B23.toInt()
     private val ROWBG = 0xFF20202A.toInt()
-    private val DRAGBG = 0xFF32323E.toInt()
     private val TXT = 0xFFECECF1.toInt()
     private val DIM = 0xFF8F8FA0.toInt()
     private val ACCENT = 0xFF6EE7B7.toInt()
@@ -121,12 +121,21 @@ class MainActivity : Activity() {
         if (drawerShown) setDrawer(false) else super.onBackPressed()
     }
 
+    // Cached medium typeface: was created fresh for every row/view.
+    private val mediumTypeface: Typeface by lazy { Typeface.create("sans-serif-medium", Typeface.NORMAL) }
+    // Cached card backgrounds, one GradientDrawable per color (never
+    // mutated after creation, so sharing is safe).
+    private val cardBgCache = HashMap<Int, GradientDrawable>()
+
     private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
 
     private fun cardBg(c: Int): GradientDrawable {
+        val cached = cardBgCache[c]
+        if (cached != null) return cached
         val gd = GradientDrawable()
         gd.cornerRadius = dp(12).toFloat()
         gd.setColor(c)
+        cardBgCache[c] = gd
         return gd
     }
 
@@ -134,7 +143,7 @@ class MainActivity : Activity() {
         val t = TextView(this)
         t.text = label
         t.textSize = 13.5f
-        t.typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+        t.typeface = mediumTypeface
         t.setTextColor(ACCENT)
         t.gravity = android.view.Gravity.CENTER
         t.setPadding(dp(12), dp(9), dp(12), dp(9))
@@ -165,7 +174,7 @@ class MainActivity : Activity() {
         t.text = txt
         t.textSize = size
         t.setTextColor(color)
-        if (bold) t.typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+        if (bold) t.typeface = mediumTypeface
         c.addView(t)
         return t
     }
@@ -195,12 +204,12 @@ class MainActivity : Activity() {
         val title = TextView(this)
         title.text = "LLM Router"
         title.textSize = 21f
-        title.typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+        title.typeface = mediumTypeface
         title.setTextColor(TXT)
         head.addView(title, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         serverPill = TextView(this)
         serverPill.textSize = 13f
-        serverPill.typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+        serverPill.typeface = mediumTypeface
         serverPill.setPadding(dp(16), dp(7), dp(16), dp(7))
         serverPill.isClickable = true
         serverPill.setOnClickListener { toggleServer() }
@@ -367,7 +376,7 @@ class MainActivity : Activity() {
         val dhead = TextView(this)
         dhead.text = "LLM Router"
         dhead.textSize = 17f
-        dhead.typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+        dhead.typeface = mediumTypeface
         dhead.setTextColor(TXT)
         dhead.setPadding(dp(18), dp(22), dp(18), dp(2))
         drawer.addView(dhead)
@@ -476,7 +485,7 @@ class MainActivity : Activity() {
             t.text = name + (if (!en) "  (disabled)" else "")
             t.textSize = 15.5f
             t.setTextColor(if (en) TXT else DIM)
-            t.typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+            t.typeface = mediumTypeface
             head.addView(t, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
             val chip = TextView(this)
             chip.text = "" + (provCounts[name] ?: 0)
@@ -487,6 +496,24 @@ class MainActivity : Activity() {
             head.addView(chip)
             card.addView(head)
             colText(card, prov.optString("baseUrl"), 12f, DIM, false)
+            // Visible actions (used to be long-press-only, so users never
+            // found them): refresh this provider's models, or delete it.
+            val btnRow = LinearLayout(this)
+            btnRow.orientation = LinearLayout.HORIZONTAL
+            btnRow.setPadding(0, dp(8), 0, 0)
+            val refreshBtn = textBtn("Refresh") { refreshProvider(name) }
+            btnRow.addView(refreshBtn, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+            btnRow.addView(space(dp(8)))
+            val deleteBtn = textBtn("Delete") {
+                AlertDialog.Builder(this)
+                    .setTitle("Delete " + name + "?")
+                    .setPositiveButton("Delete") { _, _ -> Store.removeProvider(name); refresh() }
+                    .setNegativeButton("Cancel", null)
+                    .show()
+            }
+            deleteBtn.setTextColor(RED)
+            btnRow.addView(deleteBtn, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+            card.addView(btnRow)
             // tap: nothing; long press: menu
             card.isLongClickable = true
             card.setOnLongClickListener { lpGuard { providerLongPress(name) }; true }
@@ -515,7 +542,7 @@ class MainActivity : Activity() {
             t.text = m.optString("id")
             t.textSize = 15f
             t.setTextColor(TXT)
-            t.typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+            t.typeface = mediumTypeface
             head.addView(t, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
             val chip = TextView(this@MainActivity)
             val enabled = m.optBoolean("enabled", true)
@@ -550,7 +577,7 @@ class MainActivity : Activity() {
             val t = tabs[j].getChildAt(0) as TextView
             if (j == i) {
                 t.setTextColor(ACCENT)
-                t.typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+                t.typeface = mediumTypeface
                 tabBars[j].visibility = View.VISIBLE
             } else {
                 t.setTextColor(DIM)
@@ -594,10 +621,17 @@ class MainActivity : Activity() {
             val m = ms.getJSONObject(i)
             modelIndex[m.optString("provider") + "|" + m.optString("id")] = m
         }
+        // Sort once, filter per keystroke: the sort used to run on every
+        // keystroke in the search box. Re-sorted only when dirty (see
+        // refresh(), which runs after any model change).
+        if (sortedKeysDirty || cachedSortedKeys == null) {
+            cachedSortedKeys = sortedModelKeys()
+            sortedKeysDirty = false
+        }
         modelKeys.clear()
         val q = modelQuery.lowercase()
         val hf = Store.cfg.optBoolean("hideFailed", false)
-        for (k in sortedModelKeys()) {
+        for (k in cachedSortedKeys!!) {
             val m = modelIndex[k] ?: continue
             if (q.isNotBlank() &&
                 !(m.optString("id").lowercase().contains(q) || m.optString("provider").lowercase().contains(q))) continue
@@ -633,6 +667,7 @@ class MainActivity : Activity() {
     // ================= refresh + combo area =================
 
     private fun refresh() {
+        sortedKeysDirty = true
         provCounts.clear()
         val ps = Store.providers()
         val msAll = Store.models()
@@ -709,7 +744,7 @@ class MainActivity : Activity() {
             t.text = name
             t.textSize = 15.5f
             t.setTextColor(TXT)
-            t.typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+            t.typeface = mediumTypeface
             head.addView(t, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
             val chip = TextView(this)
             chip.text = if (active) "ACTIVE \u00b7 " + ids.length() else "" + ids.length() + " models"
@@ -743,12 +778,6 @@ class MainActivity : Activity() {
             r.background = cardBg(ROWBG)
             r.setPadding(dp(10), 0, dp(10), 0)
             r.layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ROWH)
-            val handle = TextView(this)
-            handle.text = "\u2261"
-            handle.textSize = 16f
-            handle.setTextColor(DIM)
-            handle.setPadding(0, 0, dp(10), 0)
-            r.addView(handle)
             val key = keys[i]
             val m = modelIndex[key]
             val t = TextView(this)
@@ -757,6 +786,32 @@ class MainActivity : Activity() {
             t.setTextColor(TXT)
             t.maxLines = 1
             r.addView(t, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+            // Reorder with visible buttons (the old drag-to-reorder kept a
+            // shared mutable list + a delayed Runnable that raced refresh()
+            // and crashed). Index is resolved at tap time; first row has no
+            // up, last row has no down.
+            val up = TextView(this)
+            up.text = "\u25B2"
+            up.textSize = 13f
+            up.setTextColor(if (rIdx == 0) DIM else ACCENT)
+            up.setPadding(dp(8), dp(6), dp(4), dp(6))
+            up.isClickable = rIdx != 0
+            up.setOnClickListener {
+                val idx = keys.indexOf(key).let { if (it < 0) rIdx else it }
+                if (idx > 0 && Store.comboMove(name, idx, -1)) refresh()
+            }
+            r.addView(up)
+            val down = TextView(this)
+            down.text = "\u25BC"
+            down.textSize = 13f
+            down.setTextColor(if (rIdx == keys.size - 1) DIM else ACCENT)
+            down.setPadding(dp(4), dp(6), dp(8), dp(6))
+            down.isClickable = rIdx != keys.size - 1
+            down.setOnClickListener {
+                val idx = keys.indexOf(key).let { if (it < 0) rIdx else it }
+                if (idx >= 0 && idx < keys.size - 1 && Store.comboMove(name, idx, +1)) refresh()
+            }
+            r.addView(down)
             val x = TextView(this)
             x.text = "\u2715"
             x.textSize = 14f
@@ -769,82 +824,12 @@ class MainActivity : Activity() {
             }
             r.addView(x)
             wrap.addView(r)
-            // drag: hold the handle ~0.35s, then move to reorder (defensive: any
-            // inconsistency aborts the drag instead of crashing)
-            var downY = 0f
-            var dragging = false
-            var curIdx = rIdx
-            val pending = Runnable {
-                if (r.parent === wrap && keys.isNotEmpty()) {
-                    dragging = true
-                    r.background = cardBg(DRAGBG)
-                    try { wrap.parent?.requestDisallowInterceptTouchEvent(true) } catch (ignored: Exception) {}
-                }
-            }
-            handle.setOnTouchListener { v, ev ->
-                try {
-                    when (ev.actionMasked) {
-                        MotionEvent.ACTION_DOWN -> {
-                            downY = ev.y
-                            dragging = false
-                            curIdx = keys.indexOf(key).let { if (it < 0) rIdx else it }
-                            if (curIdx !in keys.indices) curIdx = rIdx
-                            v.postDelayed(pending, 350)
-                            true
-                        }
-                        MotionEvent.ACTION_MOVE -> {
-                            if (!dragging) {
-                                if (Math.abs(ev.y - downY) > dp(12)) v.removeCallbacks(pending)
-                                true
-                            } else if (wrap.childCount != keys.size || curIdx !in keys.indices) {
-                                v.removeCallbacks(pending)
-                                dragging = false
-                                r.background = cardBg(ROWBG)
-                                true
-                            } else {
-                                val dy = ev.y - downY
-                                val py = curIdx * ROWH + ROWH / 2 + dy
-                                var tt = (py / ROWH).toInt()
-                                if (tt < 0) tt = 0
-                                if (tt > keys.size - 1) tt = keys.size - 1
-                                if (tt != curIdx && tt in keys.indices) {
-                                    val item = keys.removeAt(curIdx)
-                                    keys.add(tt, item)
-                                    if (curIdx < wrap.childCount) {
-                                        val rr = wrap.getChildAt(curIdx)
-                                        wrap.removeViewAt(curIdx)
-                                        wrap.addView(rr, tt)
-                                    }
-                                    curIdx = tt
-                                }
-                                true
-                            }
-                        }
-                        MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
-                            v.removeCallbacks(pending)
-                            if (dragging) {
-                                r.background = cardBg(ROWBG)
-                                try { Store.comboSet(name, keys) } catch (ignored: Exception) {}
-                                refresh()
-                            }
-                            val was = dragging
-                            dragging = false
-                            was
-                        }
-                        else -> false
-                    }
-                } catch (e: Exception) {
-                    dragging = false
-                    r.background = cardBg(ROWBG)
-                    false
-                }
-            }
         }
         card.addView(wrap)
         val act = TextView(this)
         act.text = "Activate"
         act.textSize = 13.5f
-        act.typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+        act.typeface = mediumTypeface
         act.setTextColor(if (keys.isEmpty()) DIM else ACCENT)
         act.gravity = android.view.Gravity.CENTER
         act.background = cardBg(CARD)
@@ -1203,33 +1188,40 @@ class MainActivity : Activity() {
     private fun fetchModels() {
         Toast.makeText(this, "Fetching models\u2026", Toast.LENGTH_SHORT).show()
         Thread {
-            var added = 0
-            var failed = 0
+            val providers = ArrayList<JSONObject>()
             val ps = Store.providers()
-            val ms = Store.models()
-            val seen = HashSet<String>()
-            for (i in 0 until ms.length()) {
-                val m = ms.getJSONObject(i)
-                seen.add(m.optString("provider") + "|" + m.optString("id"))
-            }
             for (i in 0 until ps.length()) {
                 val p = ps.getJSONObject(i)
-                if (!p.optBoolean("enabled", true)) continue
-                try {
-                    val list = ProviderClient.listModels(p)
-                    for (id in list) {
-                        val key = p.optString("name") + "|" + id
-                        if (seen.contains(key)) continue
-                        ms.put(JSONObject().put("provider", p.optString("name"))
-                            .put("id", id).put("enabled", true))
-                        seen.add(key)
-                        added++
-                    }
-                } catch (e: Exception) { failed++ }
+                if (p.optBoolean("enabled", true)) providers.add(p)
             }
-            Store.save()
+            val added = java.util.concurrent.atomic.AtomicInteger(0)
+            val removed = java.util.concurrent.atomic.AtomicInteger(0)
+            val failed = java.util.concurrent.atomic.AtomicInteger(0)
+            // Parallel fetch (4 threads — network-bound, this is a phone).
+            // Each provider's list is fetched concurrently, then merged via
+            // refreshProviderModels, which adds new models AND removes stale
+            // ones (the old loop was sequential and add-only). The Store
+            // merge is synchronized so concurrent merges can't lose each
+            // other's updates.
+            val pool = java.util.concurrent.Executors.newFixedThreadPool(4)
+            for (p in providers) {
+                val name = p.optString("name")
+                pool.submit {
+                    try {
+                        val list = ProviderClient.listModels(p)
+                        val r = synchronized(Store) { Store.refreshProviderModels(name, list) }
+                        added.addAndGet(r.first)
+                        removed.addAndGet(r.second)
+                    } catch (e: Exception) { failed.incrementAndGet() }
+                }
+            }
+            pool.shutdown()
+            pool.awaitTermination(10, java.util.concurrent.TimeUnit.MINUTES)
+            val a = added.get()
+            val rm = removed.get()
+            val f = failed.get()
             runOnUiThread {
-                Toast.makeText(this, "" + added + " new models, " + failed + " providers failed",
+                Toast.makeText(this, "+" + a + " new, -" + rm + " removed, " + f + " providers failed",
                     Toast.LENGTH_LONG).show()
                 refresh()
             }
