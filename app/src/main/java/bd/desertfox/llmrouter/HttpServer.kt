@@ -232,15 +232,22 @@ class HttpServer(private val port: Int) {
                             "Cache-Control: no-cache\r\nConnection: close\r\n\r\n"
                         out.write(head.toByteArray(Charsets.ISO_8859_1))
                         out.flush()
-                        val ins = r.stream!!
-                        val buf = ByteArray(8192)
-                        while (true) {
-                            val n = try { ins.read(buf) } catch (e: Exception) { break }
-                            if (n < 0) break
-                            out.write(buf, 0, n)
-                            out.flush()
+                        // finally closes the provider stream even if the
+                        // client disconnects mid-stream, so the pooled
+                        // provider connection is released (same leak as
+                        // the non-streaming path used to have).
+                        try {
+                            val ins = r.stream!!
+                            val buf = ByteArray(8192)
+                            while (true) {
+                                val n = try { ins.read(buf) } catch (e: Exception) { break }
+                                if (n < 0) break
+                                out.write(buf, 0, n)
+                                out.flush()
+                            }
+                        } finally {
+                            r.close()
                         }
-                        r.close()
                     } else {
                         respond(out, 200, r.contentType, r.body ?: ByteArray(0))
                     }
@@ -250,7 +257,18 @@ class HttpServer(private val port: Int) {
                 lastCode = r.status
                 Store.addLog(LogEntry(System.currentTimeMillis(), pname, m, r.status, dt, lastErr))
                 Store.bumpModel(key, false, dt, lastErr)
+                val errBody = r.body ?: ByteArray(0)
+                val errCt = r.contentType
                 r.close()
+                if (r.status == 429) Store.markCooldown(key)
+                // Error-class-aware fallback: only 429 and 5xx are worth
+                // retrying on the next model. A 4xx (bad key, unknown
+                // model, bad payload) is permanent for this request —
+                // retrying the whole chain would burn battery and data
+                // for nothing, so return the provider's error as-is.
+                if (r.status == 429 || r.status in 500..599) continue
+                respond(out, r.status, errCt, errBody)
+                return
             } catch (e: Exception) {
                 val dt = System.currentTimeMillis() - t0
                 lastErr = (e.message ?: e.toString()).take(300)

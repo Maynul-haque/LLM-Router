@@ -32,6 +32,7 @@ object Store {
         cfg = try { if (f.exists()) JSONObject(f.readText()) else JSONObject() } catch (e: Exception) { JSONObject() }
         defaults()
         invalidateIndexes()
+        ensureAutoCombo()
         synchronized(log) {
             log.clear()
             val la = cfg.optJSONArray("log") ?: JSONArray()
@@ -47,6 +48,21 @@ object Store {
         if (!cfg.has("active")) cfg.put("active", JSONObject().put("type", "none"))
         if (!cfg.has("autoDisable")) cfg.put("autoDisable", true)
         if (!cfg.has("port")) cfg.put("port", 8790)
+    }
+
+    // Preinstalled "auto" combo: on first run (no combos yet), build one
+    // from the currently enabled chain, in its existing order, so RikkaHub
+    // users can type model "auto" and get the whole enabled set with
+    // fallback. Never touches existing combos; never created when there
+    // is nothing enabled. Persisted by load()'s existing debounced save().
+    private fun ensureAutoCombo() {
+        if (combos().length() != 0) return
+        val keys = enabledChain().map { it.first.optString("name") + "|" + it.second }
+        if (keys.isEmpty()) return
+        val ids = JSONArray()
+        for (k in keys) ids.put(k)
+        combos().put(JSONObject().put("name", "auto").put("models", ids))
+        invalidateIndexes()
     }
 
     fun save() {
@@ -117,6 +133,28 @@ object Store {
         providerIndex = null
         modelIndex = null
         comboIndex = null
+    }
+
+    // In-memory 429 cooldowns: model key ("provider|id") -> cooldownUntilMs.
+    // Never written to config.json, no timer thread — expiry is checked
+    // lazily against System.currentTimeMillis() on lookup, so the battery
+    // cost is zero when the server is idle.
+    private const val COOLDOWN_MS = 60_000L
+    private val cooldowns = HashMap<String, Long>()
+
+    fun markCooldown(key: String) {
+        synchronized(cooldowns) { cooldowns[key] = System.currentTimeMillis() + COOLDOWN_MS }
+    }
+
+    fun isCooledDown(key: String): Boolean {
+        synchronized(cooldowns) {
+            val until = cooldowns[key] ?: return false
+            if (System.currentTimeMillis() >= until) {
+                cooldowns.remove(key)
+                return false
+            }
+            return true
+        }
     }
 
     private fun providersByName(): HashMap<String, JSONObject> {
@@ -225,12 +263,23 @@ object Store {
         return out
     }
 
-    private fun resolveKey(key: String, out: MutableList<Pair<JSONObject, String>>) {
+    private fun resolveKey(key: String, out: MutableList<Pair<JSONObject, String>>, skipCooled: Boolean) {
         val m = findModel(key) ?: return
         if (!m.optBoolean("enabled", true)) return
         val p = providerByName(m.optString("provider")) ?: return
         if (!p.optBoolean("enabled", true)) return
+        if (skipCooled && isCooledDown(key)) return
         out.add(Pair(p, m.optString("id")))
+    }
+
+    // Resolve a list of model keys to a chain, skipping 429-cooled-down
+    // models — unless every model in the chain is cooled down, in which
+    // case the cooled models are used anyway (a slow answer beats none).
+    private fun resolveKeys(keys: List<String>): List<Pair<JSONObject, String>> {
+        val out = ArrayList<Pair<JSONObject, String>>()
+        for (k in keys) resolveKey(k, out, skipCooled = true)
+        if (out.isEmpty()) for (k in keys) resolveKey(k, out, skipCooled = false)
+        return out
     }
 
     fun activeType(): String = cfg.optJSONObject("active")?.optString("type") ?: "none"
@@ -243,15 +292,15 @@ object Store {
     // Chain for a named combo (used by /v1/chat/completions when the
     // requested model matches a combo name exposed on /v1/models).
     fun comboChain(name: String): List<Pair<JSONObject, String>> {
-        val out = ArrayList<Pair<JSONObject, String>>()
-        val ids = comboByName(name)?.optJSONArray("models") ?: return out
-        for (i in 0 until ids.length()) resolveKey(ids.optString(i), out)
-        return out
+        val ids = comboByName(name)?.optJSONArray("models") ?: return emptyList()
+        val keys = ArrayList<String>()
+        for (i in 0 until ids.length()) keys.add(ids.optString(i))
+        return resolveKeys(keys)
     }
 
     fun activeChain(): List<Pair<JSONObject, String>> {
-        val out = ArrayList<Pair<JSONObject, String>>()
-        val a = cfg.optJSONObject("active") ?: return out
+        val a = cfg.optJSONObject("active") ?: return emptyList()
+        val keys = ArrayList<String>()
         when (a.optString("type")) {
             "single", "combo" -> {
                 var ids = a.optJSONArray("models")
@@ -259,10 +308,10 @@ object Store {
                 if (a.optString("type") == "combo" && name.isNotBlank()) {
                     ids = comboByName(name)?.optJSONArray("models")
                 }
-                if (ids != null) for (i in 0 until ids.length()) resolveKey(ids.optString(i), out)
+                if (ids != null) for (i in 0 until ids.length()) keys.add(ids.optString(i))
             }
         }
-        return out
+        return resolveKeys(keys)
     }
 
     fun setActiveSingle(providerName: String, modelId: String) {

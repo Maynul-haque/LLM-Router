@@ -21,6 +21,7 @@ import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ListView
+import android.widget.ProgressBar
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
@@ -55,8 +56,16 @@ class MainActivity : Activity() {
     private lateinit var activeLine: TextView
     private lateinit var serverPill: TextView
     private lateinit var provArea: LinearLayout
+    private lateinit var provSearchBox: EditText
+    private var provQuery = ""
+    private var expandedProvider: String? = null
     private lateinit var modelsList: ListView
     private lateinit var searchBox: EditText
+    private lateinit var progressRow: LinearLayout
+    private lateinit var progressBar: ProgressBar
+    private lateinit var progressText: TextView
+    @Volatile private var testing = false
+    @Volatile private var fetching = false
     private lateinit var pPanel: LinearLayout
     private lateinit var mPanel: LinearLayout
     private lateinit var activePanel: LinearLayout
@@ -104,6 +113,14 @@ class MainActivity : Activity() {
                 .setTitle("Last crash")
                 .setMessage(txt.take(1500))
                 .setPositiveButton("OK", null)
+                // Copy sends the whole stored log (up to 2500 chars),
+                // not just the 1500 shown in the dialog, so the full
+                // stack trace can be pasted into a bug report.
+                .setNeutralButton("Copy") { _, _ ->
+                    val cm = getSystemService(CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                    cm.setPrimaryClip(android.content.ClipData.newPlainText("LLM Router crash log", txt))
+                    Toast.makeText(this, "Crash log copied", Toast.LENGTH_SHORT).show()
+                }
                 .show()
         } catch (ignored: Exception) {}
     }
@@ -259,6 +276,25 @@ class MainActivity : Activity() {
         pPanel = LinearLayout(this)
         pPanel.orientation = LinearLayout.VERTICAL
         pPanel.setPadding(0, dp(10), 0, 0)
+        provSearchBox = EditText(this)
+        provSearchBox.hint = "search provider..."
+        provSearchBox.setSingleLine(true)
+        provSearchBox.textSize = 14f
+        provSearchBox.setTextColor(TXT)
+        provSearchBox.setHintTextColor(DIM)
+        provSearchBox.setPadding(dp(12), dp(10), dp(12), dp(10))
+        provSearchBox.background = cardBg(ROWBG)
+        val pbp = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+        pbp.setMargins(dp(2), 0, dp(2), dp(8))
+        pPanel.addView(provSearchBox, pbp)
+        provSearchBox.addTextChangedListener(object : TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
+            override fun onTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
+            override fun afterTextChanged(s: Editable?) {
+                provQuery = (s?.toString() ?: "").trim()
+                buildProvArea()
+            }
+        })
         val provScroll = ScrollView(this)
         provScroll.isVerticalScrollBarEnabled = false
         provArea = LinearLayout(this)
@@ -323,6 +359,23 @@ class MainActivity : Activity() {
             true
         }
         mPanel.addView(modelsList, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+        // Small progress row at the bottom of the Models tab, shown while
+        // a test or fetch is running ("Testing 7/24").
+        progressRow = LinearLayout(this)
+        progressRow.orientation = LinearLayout.HORIZONTAL
+        progressRow.gravity = android.view.Gravity.CENTER_VERTICAL
+        progressRow.setPadding(dp(2), dp(10), dp(2), 0)
+        progressRow.visibility = View.GONE
+        progressBar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal)
+        progressBar.max = 100
+        progressBar.progress = 0
+        progressRow.addView(progressBar, LinearLayout.LayoutParams(0, dp(6), 1f))
+        progressRow.addView(space(dp(10)))
+        progressText = TextView(this)
+        progressText.textSize = 12f
+        progressText.setTextColor(DIM)
+        progressRow.addView(progressText)
+        mPanel.addView(progressRow)
         modelsRow = LinearLayout(this)
         modelsRow.orientation = LinearLayout.HORIZONTAL
         modelsRow.setPadding(0, dp(10), 0, 0)
@@ -473,13 +526,28 @@ class MainActivity : Activity() {
             provArea.addView(t)
             return
         }
+        val q = provQuery.lowercase()
+        var shown = 0
         for (i in 0 until ps.length()) {
             val prov = ps.getJSONObject(i)
             val name = prov.optString("name")
+            if (q.isNotBlank() &&
+                !(name.lowercase().contains(q) || prov.optString("baseUrl").lowercase().contains(q))) continue
+            shown++
             val card = comboCard()
             val head = LinearLayout(this)
             head.orientation = LinearLayout.HORIZONTAL
             head.gravity = android.view.Gravity.CENTER_VERTICAL
+            // Green chevron like the combo cards: tap to expand/collapse.
+            // The Refresh/Delete buttons live inside the expanded card,
+            // so the list stays compact when there are many providers.
+            val expanded = expandedProvider == name
+            val chev = TextView(this)
+            chev.text = if (expanded) "\u25BE" else "\u25B8"
+            chev.textSize = 14f
+            chev.setTextColor(ACCENT)
+            chev.setPadding(0, 0, dp(8), 0)
+            head.addView(chev)
             val en = prov.optBoolean("enabled", true)
             val t = TextView(this)
             t.text = name + (if (!en) "  (disabled)" else "")
@@ -496,28 +564,55 @@ class MainActivity : Activity() {
             head.addView(chip)
             card.addView(head)
             colText(card, prov.optString("baseUrl"), 12f, DIM, false)
-            // Visible actions (used to be long-press-only, so users never
-            // found them): refresh this provider's models, or delete it.
-            val btnRow = LinearLayout(this)
-            btnRow.orientation = LinearLayout.HORIZONTAL
-            btnRow.setPadding(0, dp(8), 0, 0)
-            val refreshBtn = textBtn("Refresh") { refreshProvider(name) }
-            btnRow.addView(refreshBtn, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-            btnRow.addView(space(dp(8)))
-            val deleteBtn = textBtn("Delete") {
-                AlertDialog.Builder(this)
-                    .setTitle("Delete " + name + "?")
-                    .setPositiveButton("Delete") { _, _ -> Store.removeProvider(name); refresh() }
-                    .setNegativeButton("Cancel", null)
-                    .show()
+            if (expanded) {
+                // All provider actions live here now — long-press is
+                // disabled for the moment, so nothing is hidden in a menu.
+                val btnRow = LinearLayout(this)
+                btnRow.orientation = LinearLayout.HORIZONTAL
+                btnRow.setPadding(0, dp(8), 0, 0)
+                val refreshBtn = textBtn("Refresh") { refreshProvider(name) }
+                btnRow.addView(refreshBtn, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+                btnRow.addView(space(dp(8)))
+                val disableBtn = textBtn(if (en) "Disable" else "Enable") {
+                    Store.setProviderEnabled(name, !en); refresh()
+                }
+                if (!en) disableBtn.setTextColor(ACCENT)
+                btnRow.addView(disableBtn, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+                card.addView(btnRow)
+                val btnRow2 = LinearLayout(this)
+                btnRow2.orientation = LinearLayout.HORIZONTAL
+                btnRow2.setPadding(0, dp(8), 0, 0)
+                val renameBtn = textBtn("Rename") { renameProviderDialog(name) }
+                btnRow2.addView(renameBtn, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+                btnRow2.addView(space(dp(8)))
+                val deleteBtn = textBtn("Delete") {
+                    AlertDialog.Builder(this)
+                        .setTitle("Delete " + name + "?")
+                        .setPositiveButton("Delete") { _, _ ->
+                            if (expandedProvider == name) expandedProvider = null
+                            Store.removeProvider(name)
+                            refresh()
+                        }
+                        .setNegativeButton("Cancel", null)
+                        .show()
+                }
+                deleteBtn.setTextColor(RED)
+                btnRow2.addView(deleteBtn, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+                card.addView(btnRow2)
             }
-            deleteBtn.setTextColor(RED)
-            btnRow.addView(deleteBtn, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-            card.addView(btnRow)
-            // tap: nothing; long press: menu
-            card.isLongClickable = true
-            card.setOnLongClickListener { lpGuard { providerLongPress(name) }; true }
+            // tap header: expand/collapse. Long-press is disabled for
+            // now — every action is in the expanded card instead.
+            head.isClickable = true
+            head.setOnClickListener { expandedProvider = if (expandedProvider == name) null else name; buildProvArea() }
             provArea.addView(card)
+        }
+        if (shown == 0) {
+            val t = TextView(this)
+            t.text = "no providers match \"" + provQuery + "\""
+            t.textSize = 13f
+            t.setTextColor(DIM)
+            t.setPadding(dp(4), dp(8), dp(4), dp(8))
+            provArea.addView(t)
         }
     }
 
@@ -614,6 +709,16 @@ class MainActivity : Activity() {
         return list.map { it.first }
     }
 
+    // "Unusable" for the Hide-failed filter: failed the last test,
+    // disabled (by hand, or auto-disabled after 3 fails), or its
+    // provider is disabled. Any of those means RikkaHub can't use it.
+    private fun isUnusable(m: JSONObject): Boolean {
+        if (!m.optBoolean("enabled", true)) return true
+        val p = Store.providerByName(m.optString("provider"))
+        if (p != null && !p.optBoolean("enabled", true)) return true
+        return m.has("lastOk") && !m.optBoolean("lastOk")
+    }
+
     private fun rebuildModelKeys() {
         modelIndex.clear()
         val ms = Store.models()
@@ -635,7 +740,7 @@ class MainActivity : Activity() {
             val m = modelIndex[k] ?: continue
             if (q.isNotBlank() &&
                 !(m.optString("id").lowercase().contains(q) || m.optString("provider").lowercase().contains(q))) continue
-            if (hf && m.has("lastOk") && !m.optBoolean("lastOk")) continue
+            if (hf && isUnusable(m)) continue
             modelKeys.add(k)
         }
     }
@@ -656,6 +761,18 @@ class MainActivity : Activity() {
             modelsRow.addView(textBtn("Test all") { testAll() },
                 LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
             modelsRow.addView(space(dp(8)))
+            // Visible Hide-all toggle (it used to live only in the
+            // long-press menu, so most users never found it). When on,
+            // every unusable model is hidden from the list; tap again
+            // to show them. Label + green colour show the current state.
+            val hideOn = Store.cfg.optBoolean("hideFailed", false)
+            val hideBtn = textBtn(if (hideOn) "Show failed" else "Hide failed") {
+                Store.cfg.put("hideFailed", !hideOn); Store.save(); refresh()
+            }
+            if (hideOn) hideBtn.setTextColor(ACCENT)
+            modelsRow.addView(hideBtn,
+                LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+            modelsRow.addView(space(dp(8)))
             modelsRow.addView(textBtn("Select") { selectMode = true; selected.clear(); refresh() },
                 LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
             modelsRow.addView(space(dp(8)))
@@ -663,6 +780,24 @@ class MainActivity : Activity() {
                 LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         }
     }
+
+    // ================= progress row (test / fetch) =================
+    // All three run on the UI thread only; workers post via runOnUiThread.
+    private fun showProgress(label: String, total: Int) {
+        progressBar.max = total.coerceAtLeast(1)
+        progressBar.progress = 0
+        progressText.text = label + " 0/" + total
+        progressRow.visibility = View.VISIBLE
+    }
+
+    private fun updateProgress(label: String, done: Int, total: Int) {
+        progressBar.max = total.coerceAtLeast(1)
+        progressBar.progress = done.coerceAtMost(total)
+        progressText.text = label + " " + done + "/" + total
+        if (progressRow.visibility != View.VISIBLE) progressRow.visibility = View.VISIBLE
+    }
+
+    private fun hideProgress() { progressRow.visibility = View.GONE }
 
     // ================= refresh + combo area =================
 
@@ -950,24 +1085,31 @@ class MainActivity : Activity() {
                     dot.textSize = 16f
                     dot.setPadding(0, 0, dp(10), 0)
                     l.addView(dot)
+                    // Two-line row: the model id wraps onto as many lines
+                    // as it needs (it used to be a single line with no
+                    // ellipsis, so long ids were hard-clipped at the right
+                    // edge); provider name underneath in small dim text.
+                    val inner = LinearLayout(this@MainActivity)
+                    inner.orientation = LinearLayout.VERTICAL
+                    l.addView(inner, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
                     val t = TextView(this@MainActivity)
                     t.textSize = 14.5f
                     t.setTextColor(TXT)
-                    t.maxLines = 1
-                    l.addView(t, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+                    inner.addView(t)
                     val pv = TextView(this@MainActivity)
                     pv.textSize = 11.5f
                     pv.setTextColor(DIM)
-                    l.addView(pv)
+                    inner.addView(pv)
                     l
                 }
                 val m = modelIndex[key]
                 val dot = c.getChildAt(0) as TextView
                 dot.text = if (checked[key] == true) "\u25C9" else "\u25CB"
                 dot.setTextColor(if (checked[key] == true) ACCENT else DIM)
-                val t = c.getChildAt(1) as TextView
+                val inner = c.getChildAt(1) as LinearLayout
+                val t = inner.getChildAt(0) as TextView
                 t.text = if (m != null) m.optString("id") else key
-                val pv = c.getChildAt(2) as TextView
+                val pv = inner.getChildAt(1) as TextView
                 pv.text = key.substringBefore("|")
                 c.setOnClickListener {
                     checked[key] = !(checked[key] ?: false)
@@ -1003,6 +1145,9 @@ class MainActivity : Activity() {
             .show()
     }
 
+    // Long-press menu for providers — kept for later, but unused for
+    // now: long-press is disabled and every action lives in the
+    // expanded provider card instead.
     private fun providerLongPress(name: String) {
         val p = Store.providerByName(name) ?: return
         val enabled = p.optBoolean("enabled", true)
@@ -1186,6 +1331,8 @@ class MainActivity : Activity() {
     }
 
     private fun fetchModels() {
+        if (testing || fetching) { Toast.makeText(this, "Already running, please wait", Toast.LENGTH_SHORT).show(); return }
+        fetching = true
         Toast.makeText(this, "Fetching models\u2026", Toast.LENGTH_SHORT).show()
         Thread {
             val providers = ArrayList<JSONObject>()
@@ -1194,9 +1341,12 @@ class MainActivity : Activity() {
                 val p = ps.getJSONObject(i)
                 if (p.optBoolean("enabled", true)) providers.add(p)
             }
+            val totalProviders = providers.size
+            runOnUiThread { showProgress("Fetching", totalProviders) }
             val added = java.util.concurrent.atomic.AtomicInteger(0)
             val removed = java.util.concurrent.atomic.AtomicInteger(0)
             val failed = java.util.concurrent.atomic.AtomicInteger(0)
+            val doneProviders = java.util.concurrent.atomic.AtomicInteger(0)
             // Parallel fetch (4 threads — network-bound, this is a phone).
             // Each provider's list is fetched concurrently, then merged via
             // refreshProviderModels, which adds new models AND removes stale
@@ -1213,6 +1363,10 @@ class MainActivity : Activity() {
                         added.addAndGet(r.first)
                         removed.addAndGet(r.second)
                     } catch (e: Exception) { failed.incrementAndGet() }
+                    finally {
+                        val d = doneProviders.incrementAndGet()
+                        runOnUiThread { updateProgress("Fetching", d, totalProviders) }
+                    }
                 }
             }
             pool.shutdown()
@@ -1220,7 +1374,9 @@ class MainActivity : Activity() {
             val a = added.get()
             val rm = removed.get()
             val f = failed.get()
+            fetching = false
             runOnUiThread {
+                hideProgress()
                 Toast.makeText(this, "+" + a + " new, -" + rm + " removed, " + f + " providers failed",
                     Toast.LENGTH_LONG).show()
                 refresh()
@@ -1239,8 +1395,39 @@ class MainActivity : Activity() {
         var err = ""
         try {
             val r = ProviderClient.chat(p, m.optString("id"), body, false, 60000)
-            ok = r.status in 200..299
-            if (!ok) err = String(r.body ?: ByteArray(0), Charsets.UTF_8).take(120)
+            val raw = String(r.body ?: ByteArray(0), Charsets.UTF_8)
+            // "Pass" means: this key can actually use this model.
+            // A bare 200 is not enough — some relays answer 200 with an
+            // error object, or an empty reply, for models the key isn't
+            // entitled to (e.g. paid models on a free key). Those must
+            // fail, or RikkaHub will pick them later and fail instead.
+            when {
+                r.status == 429 -> {
+                    // Rate-limited proves the key IS entitled to this
+                    // model — the provider recognised it and throttled
+                    // it instead of rejecting it. So it passes, but the
+                    // note is kept so the user knows it was throttled.
+                    ok = true
+                    err = "rate limited (429)"
+                }
+                r.status !in 200..299 -> {
+                    ok = false
+                    err = raw.take(120)
+                }
+                else -> {
+                    val j = try { JSONObject(raw) } catch (e: Exception) { null }
+                    // opt() returns JSONObject.NULL for an explicit null,
+                    // which is not a real error — only a present value is.
+                    val topErr = j?.opt("error")?.takeUnless { it === JSONObject.NULL }
+                    val content = j?.optJSONArray("choices")?.optJSONObject(0)
+                        ?.optJSONObject("message")?.optString("content", "") ?: ""
+                    when {
+                        topErr != null -> { ok = false; err = topErr.toString().take(120) }
+                        content.isBlank() -> { ok = false; err = "empty reply" }
+                        else -> ok = true
+                    }
+                }
+            }
             r.close()
         } catch (e: Exception) { err = (e.message ?: e.toString()).take(120) }
         return Triple(ok, System.currentTimeMillis() - t0, err)
@@ -1248,37 +1435,76 @@ class MainActivity : Activity() {
 
     private fun testBatch(keysIn: List<String>) {
         if (keysIn.isEmpty()) { Toast.makeText(this, "Nothing selected", Toast.LENGTH_SHORT).show(); return }
-        Toast.makeText(this, "Testing " + keysIn.size + " models\u2026", Toast.LENGTH_SHORT).show()
+        // Re-entry guard: a second tap while a batch is running used to
+        // start a second pool on the same models.
+        if (testing || fetching) { Toast.makeText(this, "Already running, please wait", Toast.LENGTH_SHORT).show(); return }
+        testing = true
+        val total = keysIn.size
+        val done = java.util.concurrent.atomic.AtomicInteger(0)
+        runOnUiThread { showProgress("Testing", total) }
+        Toast.makeText(this, "Testing " + total + " models\u2026", Toast.LENGTH_SHORT).show()
         Thread {
-            val results = java.util.Collections.synchronizedList(ArrayList<Triple<String, Boolean, Long>>())
-            val errs = java.util.Collections.synchronizedMap(HashMap<String, String>())
             val pool = java.util.concurrent.Executors.newFixedThreadPool(8)
             for (k in keysIn) {
                 pool.submit {
-                    val m = Store.findModel(k) ?: return@submit
-                    val r = chatProbe(m)
-                    results.add(Triple(k, r.first, r.second))
-                    if (r.third.isNotBlank()) errs[k] = r.third
+                    try {
+                        val m = Store.findModel(k) ?: return@submit
+                        val r = chatProbe(m)
+                        // Apply each result as it finishes (instead of
+                        // only after the whole batch): the list updates
+                        // live, and one slow model can't hold the rest
+                        // hostage. bumpModel/addLog only touch this
+                        // model's own object plus synchronized save/log.
+                        try {
+                            Store.bumpModel(k, r.first, r.second, r.third)
+                            Store.addLog(LogEntry(System.currentTimeMillis(), m.optString("provider"),
+                                m.optString("id"), if (r.first) 200 else 0, r.second, r.third))
+                        } catch (ignored: Exception) {}
+                    } finally {
+                        val d = done.incrementAndGet()
+                        runOnUiThread {
+                            updateProgress("Testing", d, total)
+                            if (d % 4 == 0 || d == total) {
+                                // Rebuild the visible keys, not just
+                                // re-render: with Hide failed on, a model
+                                // that just failed must vanish right away
+                                // instead of waiting for the batch to end.
+                                rebuildModelKeys()
+                                (modelsList.adapter as BaseAdapter).notifyDataSetChanged()
+                            }
+                        }
+                    }
                 }
             }
             pool.shutdown()
-            pool.awaitTermination(15, java.util.concurrent.TimeUnit.MINUTES)
-            for (r in results) {
-                val m = Store.findModel(r.first)
-                Store.bumpModel(r.first, r.second, r.third, errs[r.first] ?: "")
-                if (m != null) Store.addLog(LogEntry(System.currentTimeMillis(), m.optString("provider"),
-                    m.optString("id"), if (r.second) 200 else 0, r.third, errs[r.first] ?: ""))
-            }
-            val n = results.size
+            // The old code ignored awaitTermination's return value: when
+            // it timed out, the toast still claimed every model was
+            // tested. Now a timeout stops the pool and says so.
+            val finished = pool.awaitTermination(15, java.util.concurrent.TimeUnit.MINUTES)
+            if (!finished) pool.shutdownNow()
+            testing = false
+            val d = done.get()
             runOnUiThread {
-                Toast.makeText(this, "" + n + " models tested", Toast.LENGTH_SHORT).show()
+                hideProgress()
+                Toast.makeText(this,
+                    if (finished) "" + d + " models tested"
+                    else "" + d + " of " + total + " tested (timed out)",
+                    Toast.LENGTH_LONG).show()
                 refresh()
             }
         }.start()
     }
 
     private fun testAll() {
-        val keys = ArrayList(modelKeys)
+        // Test every stored model, not just the ones currently visible:
+        // modelKeys is filtered by the search box / hide-failed, so the
+        // old Test all silently skipped models the user couldn't see.
+        val keys = ArrayList<String>()
+        val ms = Store.models()
+        for (i in 0 until ms.length()) {
+            val m = ms.getJSONObject(i)
+            keys.add(m.optString("provider") + "|" + m.optString("id"))
+        }
         testBatch(keys)
     }
 

@@ -34,7 +34,14 @@ object ProviderClient {
         // the connection alive lets the next request reuse it.
         val code = c.responseCode
         if (code != 200) throw RuntimeException("HTTP " + code)
-        val body = readBounded(c.inputStream, MAX_MODELS_RESPONSE_BYTES)
+        // Close the body stream: on Android HttpURLConnection is backed
+        // by OkHttp, and a connection only returns to the pool once its
+        // response body is closed. Leaving it open leaked one connection
+        // per call — with OkHttp's 5-per-host limit, Test All stalled
+        // after the first 4–5 models of the same host and the rest never
+        // even started. No disconnect() here: closing the body is what
+        // lets the connection be reused.
+        val body = c.inputStream.use { readBounded(it, MAX_MODELS_RESPONSE_BYTES) }
         val j = JSONObject(String(body, Charsets.UTF_8))
         val data = j.optJSONArray("data") ?: throw RuntimeException("no data[] in response")
         val out = ArrayList<String>()
@@ -83,14 +90,17 @@ object ProviderClient {
         if (code in 200..299) {
             return if (stream) ChatResult(code, ct, null, c.inputStream)
             else try {
-                ChatResult(code, ct, readBounded(c.inputStream, MAX_CHAT_RESPONSE_BYTES), null)
-            } catch (e: RuntimeException) {
+                // use{} closes the body stream, releasing the connection
+                // back to the pool (see listModels: without the close,
+                // OkHttp's 5-per-host limit stalls all later requests).
+                ChatResult(code, ct, c.inputStream.use { readBounded(it, MAX_CHAT_RESPONSE_BYTES) }, null)
+            } catch (e: Exception) {
                 c.disconnect()
                 throw e
             }
         }
         val err = try {
-            c.errorStream?.let { readBounded(it, MAX_CHAT_RESPONSE_BYTES) }?.toString(Charsets.UTF_8) ?: ""
+            c.errorStream?.use { readBounded(it, MAX_CHAT_RESPONSE_BYTES) }?.toString(Charsets.UTF_8) ?: ""
         } catch (e: Exception) { "" }
         c.disconnect()
         return ChatResult(code, ct, err.toByteArray(Charsets.UTF_8), null)
