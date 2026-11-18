@@ -110,6 +110,13 @@ class MainActivity : Activity() {
 
     override fun onResume() { super.onResume(); refresh() }
 
+    override fun onPause() {
+        // Flush any debounced Store.save() so the last 2s of state
+        // (logs, model results) are not lost if the process is killed.
+        Store.saveNow()
+        super.onPause()
+    }
+
     override fun onBackPressed() {
         if (drawerShown) setDrawer(false) else super.onBackPressed()
     }

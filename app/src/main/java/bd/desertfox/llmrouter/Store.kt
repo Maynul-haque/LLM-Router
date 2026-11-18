@@ -4,6 +4,9 @@ import android.content.Context
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
+import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledExecutorService
+import java.util.concurrent.TimeUnit
 
 class LogEntry(val ts: Long, val provider: String, val model: String,
                val status: Int, val latencyMs: Long, val error: String) {
@@ -46,14 +49,59 @@ object Store {
     }
 
     fun save() {
-        try {
-            val ctx = appCtx ?: return
-            val arr = JSONArray()
-            synchronized(log) { for (e in log.takeLast(LOG_CAP)) arr.put(e.toJson()) }
-            cfg.put("log", arr)
-            File(ctx.filesDir, "config.json").writeText(cfg.toString())
-        } catch (e: Exception) { }
+        // Debounced persistence (perf fix #1): save() used to rewrite the
+        // whole config.json on every log/bump — i.e. twice per chat request,
+        // ~200 times for a 100-model test run. Now repeated calls coalesce
+        // into a single write, at most once per SAVE_DEBOUNCE_MS.
+        synchronized(this) {
+            if (saveScheduled) return
+            val delay = (SAVE_DEBOUNCE_MS - (System.currentTimeMillis() - lastSaveMs))
+                .coerceAtLeast(0L)
+            saveScheduled = true
+            saveExecutor.schedule({ saveNow() }, delay, TimeUnit.MILLISECONDS)
+        }
     }
+
+    /** Write config.json now, on the calling thread. Call from onPause so
+     *  the last debounced write is not lost if the process is killed. */
+    fun saveNow() {
+        val ctx: Context
+        val text: String
+        synchronized(this) {
+            saveScheduled = false
+            ctx = appCtx ?: return
+            try {
+                val arr = JSONArray()
+                synchronized(log) { for (e in log.takeLast(LOG_CAP)) arr.put(e.toJson()) }
+                cfg.put("log", arr)
+                text = cfg.toString()
+            } catch (e: Exception) {
+                return
+            }
+            lastSaveMs = System.currentTimeMillis()
+        }
+        // Atomic-ish replace: write to a temp file, then rename, so a
+        // crash mid-write can never leave a half-written config.json.
+        try {
+            val tmp = File(ctx.filesDir, "config.json.tmp")
+            tmp.writeText(text)
+            if (!tmp.renameTo(File(ctx.filesDir, "config.json"))) {
+                File(ctx.filesDir, "config.json").writeText(text)
+                tmp.delete()
+            }
+        } catch (e: Exception) {
+        }
+    }
+
+    // Debounced-save state. The executor's thread is created lazily on the
+    // first scheduled write, is a daemon, and is the only extra thread.
+    private const val SAVE_DEBOUNCE_MS = 2000L
+    private val saveExecutor: ScheduledExecutorService =
+        Executors.newSingleThreadScheduledExecutor { r ->
+            Thread(r, "llmrouter-save").apply { isDaemon = true }
+        }
+    @Volatile private var saveScheduled = false
+    @Volatile private var lastSaveMs = 0L
 
     fun providers(): JSONArray = cfg.optJSONArray("providers") ?: JSONArray()
 

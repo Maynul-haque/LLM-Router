@@ -1,13 +1,16 @@
 package bd.desertfox.llmrouter
 
 import android.util.Log
+import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
-import java.io.ByteArrayOutputStream
 import java.io.InputStream
 import java.net.InetAddress
 import java.net.ServerSocket
 import java.net.Socket
-import java.util.concurrent.Executors
+import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.RejectedExecutionException
+import java.util.concurrent.ThreadPoolExecutor
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import org.json.JSONArray
 import org.json.JSONObject
@@ -25,7 +28,17 @@ object HttpServerHolder {
 }
 
 class HttpServer(private val port: Int) {
-    private val pool = Executors.newCachedThreadPool()
+    // Bounded pool (perf fix #3): newCachedThreadPool() grew one thread
+    // per connection with no limit, so a burst of clients could exhaust
+    // memory on thread stacks. 8 core / 16 max threads + a 64-deep queue
+    // is plenty for a loopback server; beyond that we answer 503
+    // instead of spawning more threads.
+    private val pool = ThreadPoolExecutor(
+        8, 16, 60L, TimeUnit.SECONDS,
+        LinkedBlockingQueue(64),
+        { r -> Thread(r, "llmrouter-conn").apply { isDaemon = true } },
+        ThreadPoolExecutor.AbortPolicy()
+    )
     private var ss: ServerSocket? = null
     private val alive = AtomicBoolean(false)
 
@@ -36,9 +49,23 @@ class HttpServer(private val port: Int) {
                 ss = ServerSocket(port, 50, InetAddress.getByName("127.0.0.1"))
                 while (alive.get()) {
                     val s = try { ss!!.accept() } catch (e: Exception) { break }
-                    pool.submit {
-                        try { handle(s) } catch (e: Exception) {
-                            Log.w("llmrouter", "conn", e)
+                    try {
+                        pool.execute {
+                            try { handle(s) } catch (e: Exception) {
+                                Log.w("llmrouter", "conn", e)
+                                try { s.close() } catch (e2: Exception) {}
+                            }
+                        }
+                    } catch (e: RejectedExecutionException) {
+                        // Pool + queue are full: shed load with 503
+                        // instead of queuing unboundedly or spawning threads.
+                        try {
+                            val out = BufferedOutputStream(s.getOutputStream())
+                            respond(out, 503, "application/json",
+                                "{\"error\":{\"message\":\"server busy\"}}".toByteArray())
+                            out.flush()
+                        } catch (e2: Exception) {
+                        } finally {
                             try { s.close() } catch (e2: Exception) {}
                         }
                     }
@@ -55,51 +82,78 @@ class HttpServer(private val port: Int) {
 
     class Req(val method: String, val path: String, val headers: Map<String, String>, val body: ByteArray)
 
+    // Hard caps (perf fix #2): a request must never be able to force an
+    // unbounded allocation. Headers are capped at 32 KB in total, a single
+    // header line at 8 KB, and a body at 10 MB.
+    private val MAX_HEADER_BYTES = 32768
+    private val MAX_BODY_BYTES = 10 * 1024 * 1024
+
     private fun readReq(ins: InputStream): Req? {
-        val hb = ByteArrayOutputStream()
-        var state = 0
-        while (state < 4) {
-            val b = ins.read()
-            if (b < 0) return null
-            hb.write(b)
-            state = when (b) {
-                13 -> if (state == 0) 1 else if (state == 2) 3 else 0
-                10 -> if (state == 1) 2 else if (state == 3) 4 else 0
-                else -> 0
+        // BufferedInputStream fills an 8 KB buffer per syscall, so the
+        // per-byte loop below runs on in-memory bytes instead of one
+        // syscall per byte (the old code called ins.read() per byte).
+        // The body is read from the same buffered stream, so no bytes
+        // already buffered ahead of the header are lost.
+        val bin = BufferedInputStream(ins, 8192)
+        var totalHeaderBytes = 0
+        fun readLine(): String? {
+            val sb = StringBuilder()
+            while (true) {
+                val b = bin.read()
+                if (b < 0) return if (sb.isEmpty()) null else sb.toString()
+                totalHeaderBytes++
+                if (totalHeaderBytes > MAX_HEADER_BYTES)
+                    throw IllegalArgumentException("header too large")
+                if (b == '\n'.code) break
+                if (b != '\r'.code) sb.append(b.toChar())
+                if (sb.length > 8192)
+                    throw IllegalArgumentException("header line too large")
             }
+            return sb.toString()
         }
-        val headText = String(hb.toByteArray(), Charsets.ISO_8859_1)
-        val lines = headText.trim().split("\r\n")
-        val first = lines[0].split(" ")
+        val firstLine = readLine() ?: return null
+        val first = firstLine.split(" ")
         if (first.size < 2) return null
         val method = first[0]
         val path = first[1]
         val headers = HashMap<String, String>()
-        for (i in 1 until lines.size) {
-            val idx = lines[i].indexOf(':')
-            if (idx > 0) headers[lines[i].substring(0, idx).trim().lowercase()] = lines[i].substring(idx + 1).trim()
+        while (true) {
+            val line = readLine() ?: return null
+            if (line.isEmpty()) break
+            val idx = line.indexOf(':')
+            if (idx > 0) headers[line.substring(0, idx).trim().lowercase()] =
+                line.substring(idx + 1).trim()
         }
         val cl = headers["content-length"]?.toIntOrNull() ?: 0
+        if (cl < 0 || cl > MAX_BODY_BYTES)
+            throw IllegalArgumentException("body too large")
         val body = if (cl > 0) {
             val b = ByteArray(cl)
             var r = 0
             while (r < cl) {
-                val n = ins.read(b, r, cl - r)
+                val n = bin.read(b, r, cl - r)
                 if (n < 0) break
                 r += n
             }
-            b
+            if (r < cl) b.copyOf(r) else b
         } else ByteArray(0)
         return Req(method, path, headers, body)
     }
 
     private fun handle(s: Socket) {
         s.tcpNoDelay = true
-        val req = readReq(s.getInputStream())
-        if (req == null) { try { s.close() } catch (e: Exception) {}; return }
         val out = BufferedOutputStream(s.getOutputStream())
-        val route = req.path.substringBefore('?')
         try {
+            val req = try {
+                readReq(s.getInputStream())
+            } catch (e: IllegalArgumentException) {
+                respond(out, 413, "application/json",
+                    "{\"error\":{\"message\":\"request too large\"}}".toByteArray())
+                out.flush()
+                return
+            }
+            if (req == null) return
+            val route = req.path.substringBefore('?')
             when {
                 route == "/health" -> respond(out, 200, "application/json", "{\"ok\":true}".toByteArray())
                 route == "/v1/models" -> handleModels(out)
