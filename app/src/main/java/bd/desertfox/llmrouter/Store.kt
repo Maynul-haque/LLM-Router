@@ -4,6 +4,9 @@ import android.content.Context
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
+import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledExecutorService
+import java.util.concurrent.TimeUnit
 
 class LogEntry(val ts: Long, val provider: String, val model: String,
                val status: Int, val latencyMs: Long, val error: String) {
@@ -28,6 +31,8 @@ object Store {
         val f = File(ctx.filesDir, "config.json")
         cfg = try { if (f.exists()) JSONObject(f.readText()) else JSONObject() } catch (e: Exception) { JSONObject() }
         defaults()
+        invalidateIndexes()
+        ensureAutoCombo()
         synchronized(log) {
             log.clear()
             val la = cfg.optJSONArray("log") ?: JSONArray()
@@ -45,31 +50,162 @@ object Store {
         if (!cfg.has("port")) cfg.put("port", 8790)
     }
 
-    fun save() {
-        try {
-            val ctx = appCtx ?: return
-            val arr = JSONArray()
-            synchronized(log) { for (e in log.takeLast(LOG_CAP)) arr.put(e.toJson()) }
-            cfg.put("log", arr)
-            File(ctx.filesDir, "config.json").writeText(cfg.toString())
-        } catch (e: Exception) { }
+    // Preinstalled "auto" combo: on first run (no combos yet), build one
+    // from the currently enabled chain, in its existing order, so RikkaHub
+    // users can type model "auto" and get the whole enabled set with
+    // fallback. Never touches existing combos; never created when there
+    // is nothing enabled. Persisted by load()'s existing debounced save().
+    private fun ensureAutoCombo() {
+        if (combos().length() != 0) return
+        val keys = enabledChain().map { it.first.optString("name") + "|" + it.second }
+        if (keys.isEmpty()) return
+        val ids = JSONArray()
+        for (k in keys) ids.put(k)
+        combos().put(JSONObject().put("name", "auto").put("models", ids))
+        invalidateIndexes()
     }
+
+    fun save() {
+        // Debounced persistence (perf fix #1): save() used to rewrite the
+        // whole config.json on every log/bump — i.e. twice per chat request,
+        // ~200 times for a 100-model test run. Now repeated calls coalesce
+        // into a single write, at most once per SAVE_DEBOUNCE_MS.
+        synchronized(this) {
+            if (saveScheduled) return
+            val delay = (SAVE_DEBOUNCE_MS - (System.currentTimeMillis() - lastSaveMs))
+                .coerceAtLeast(0L)
+            saveScheduled = true
+            saveExecutor.schedule({ saveNow() }, delay, TimeUnit.MILLISECONDS)
+        }
+    }
+
+    /** Write config.json now, on the calling thread. Call from onPause so
+     *  the last debounced write is not lost if the process is killed. */
+    fun saveNow() {
+        val ctx: Context
+        val text: String
+        synchronized(this) {
+            saveScheduled = false
+            ctx = appCtx ?: return
+            try {
+                val arr = JSONArray()
+                synchronized(log) { for (e in log.takeLast(LOG_CAP)) arr.put(e.toJson()) }
+                cfg.put("log", arr)
+                text = cfg.toString()
+            } catch (e: Exception) {
+                return
+            }
+            lastSaveMs = System.currentTimeMillis()
+        }
+        // Atomic-ish replace: write to a temp file, then rename, so a
+        // crash mid-write can never leave a half-written config.json.
+        try {
+            val tmp = File(ctx.filesDir, "config.json.tmp")
+            tmp.writeText(text)
+            if (!tmp.renameTo(File(ctx.filesDir, "config.json"))) {
+                File(ctx.filesDir, "config.json").writeText(text)
+                tmp.delete()
+            }
+        } catch (e: Exception) {
+        }
+    }
+
+    // Debounced-save state. The executor's thread is created lazily on the
+    // first scheduled write, is a daemon, and is the only extra thread.
+    private const val SAVE_DEBOUNCE_MS = 2000L
+    private val saveExecutor: ScheduledExecutorService =
+        Executors.newSingleThreadScheduledExecutor { r ->
+            Thread(r, "llmrouter-save").apply { isDaemon = true }
+        }
+    @Volatile private var saveScheduled = false
+    @Volatile private var lastSaveMs = 0L
 
     fun providers(): JSONArray = cfg.optJSONArray("providers") ?: JSONArray()
 
-    fun providerByName(n: String): JSONObject? {
-        val ps = providers()
-        for (i in 0 until ps.length()) {
-            val p = ps.getJSONObject(i)
-            if (p.optString("name") == n) return p
-        }
-        return null
+    // Lazily-built O(1) indexes. Each is a single O(n) scan rebuilt on
+    // next use after any mutation that can change its keys (see
+    // invalidateIndexes()); lookups between mutations are O(1).
+    private var providerIndex: HashMap<String, JSONObject>? = null
+    private var modelIndex: HashMap<String, JSONObject>? = null
+    private var comboIndex: HashMap<String, JSONObject>? = null
+
+    private fun invalidateIndexes() {
+        providerIndex = null
+        modelIndex = null
+        comboIndex = null
     }
+
+    // In-memory 429 cooldowns: model key ("provider|id") -> cooldownUntilMs.
+    // Never written to config.json, no timer thread — expiry is checked
+    // lazily against System.currentTimeMillis() on lookup, so the battery
+    // cost is zero when the server is idle.
+    private const val COOLDOWN_MS = 60_000L
+    private val cooldowns = HashMap<String, Long>()
+
+    fun markCooldown(key: String) {
+        synchronized(cooldowns) { cooldowns[key] = System.currentTimeMillis() + COOLDOWN_MS }
+    }
+
+    fun isCooledDown(key: String): Boolean {
+        synchronized(cooldowns) {
+            val until = cooldowns[key] ?: return false
+            if (System.currentTimeMillis() >= until) {
+                cooldowns.remove(key)
+                return false
+            }
+            return true
+        }
+    }
+
+    private fun providersByName(): HashMap<String, JSONObject> {
+        var idx = providerIndex
+        if (idx == null) {
+            idx = HashMap()
+            val ps = providers()
+            for (i in 0 until ps.length()) {
+                val p = ps.getJSONObject(i)
+                idx[p.optString("name")] = p
+            }
+            providerIndex = idx
+        }
+        return idx
+    }
+
+    private fun modelsByKey(): HashMap<String, JSONObject> {
+        var idx = modelIndex
+        if (idx == null) {
+            idx = HashMap()
+            val ms = models()
+            for (i in 0 until ms.length()) {
+                val m = ms.getJSONObject(i)
+                idx[m.optString("provider") + "|" + m.optString("id")] = m
+            }
+            modelIndex = idx
+        }
+        return idx
+    }
+
+    private fun combosByName(): HashMap<String, JSONObject> {
+        var idx = comboIndex
+        if (idx == null) {
+            idx = HashMap()
+            val cs = combos()
+            for (i in 0 until cs.length()) {
+                val c = cs.getJSONObject(i)
+                idx[c.optString("name")] = c
+            }
+            comboIndex = idx
+        }
+        return idx
+    }
+
+    fun providerByName(n: String): JSONObject? = providersByName()[n]
 
     fun addProvider(name: String, baseUrl: String, apiKey: String): Boolean {
         if (name.isBlank() || baseUrl.isBlank() || providerByName(name) != null) return false
         providers().put(JSONObject().put("name", name).put("baseUrl", baseUrl.trimEnd('/'))
             .put("apiKey", apiKey).put("enabled", true))
+        invalidateIndexes()
         save()
         return true
     }
@@ -105,17 +241,18 @@ object Store {
             val ids = cfg.optJSONObject("active")?.optJSONArray("models")
             if (ids != null && ids.length() > 0 && ids.optString(0).startsWith(name + "|")) clearActive()
         }
+        invalidateIndexes()
         save()
     }
 
     fun models(): JSONArray = cfg.optJSONArray("models") ?: JSONArray()
 
-    fun findModel(key: String): JSONObject? {
-        val ms = models()
-        for (i in 0 until ms.length()) {
-            val m = ms.getJSONObject(i)
-            if (m.optString("provider") + "|" + m.optString("id") == key) return m
-        }
+    fun findModel(key: String): JSONObject? = modelsByKey()[key]
+
+    /** First enabled model with this id, any provider — for /v1/chat/completions
+     *  when a client (e.g. RikkaHub) asks for a single model by id. */
+    fun findEnabledModelById(id: String): Pair<JSONObject, String>? {
+        for ((p, m) in enabledChain()) if (m == id) return Pair(p, m)
         return null
     }
 
@@ -133,12 +270,23 @@ object Store {
         return out
     }
 
-    private fun resolveKey(key: String, out: MutableList<Pair<JSONObject, String>>) {
+    private fun resolveKey(key: String, out: MutableList<Pair<JSONObject, String>>, skipCooled: Boolean) {
         val m = findModel(key) ?: return
         if (!m.optBoolean("enabled", true)) return
         val p = providerByName(m.optString("provider")) ?: return
         if (!p.optBoolean("enabled", true)) return
+        if (skipCooled && isCooledDown(key)) return
         out.add(Pair(p, m.optString("id")))
+    }
+
+    // Resolve a list of model keys to a chain, skipping 429-cooled-down
+    // models — unless every model in the chain is cooled down, in which
+    // case the cooled models are used anyway (a slow answer beats none).
+    private fun resolveKeys(keys: List<String>): List<Pair<JSONObject, String>> {
+        val out = ArrayList<Pair<JSONObject, String>>()
+        for (k in keys) resolveKey(k, out, skipCooled = true)
+        if (out.isEmpty()) for (k in keys) resolveKey(k, out, skipCooled = false)
+        return out
     }
 
     fun activeType(): String = cfg.optJSONObject("active")?.optString("type") ?: "none"
@@ -151,15 +299,15 @@ object Store {
     // Chain for a named combo (used by /v1/chat/completions when the
     // requested model matches a combo name exposed on /v1/models).
     fun comboChain(name: String): List<Pair<JSONObject, String>> {
-        val out = ArrayList<Pair<JSONObject, String>>()
-        val ids = comboByName(name)?.optJSONArray("models") ?: return out
-        for (i in 0 until ids.length()) resolveKey(ids.optString(i), out)
-        return out
+        val ids = comboByName(name)?.optJSONArray("models") ?: return emptyList()
+        val keys = ArrayList<String>()
+        for (i in 0 until ids.length()) keys.add(ids.optString(i))
+        return resolveKeys(keys)
     }
 
     fun activeChain(): List<Pair<JSONObject, String>> {
-        val out = ArrayList<Pair<JSONObject, String>>()
-        val a = cfg.optJSONObject("active") ?: return out
+        val a = cfg.optJSONObject("active") ?: return emptyList()
+        val keys = ArrayList<String>()
         when (a.optString("type")) {
             "single", "combo" -> {
                 var ids = a.optJSONArray("models")
@@ -167,10 +315,10 @@ object Store {
                 if (a.optString("type") == "combo" && name.isNotBlank()) {
                     ids = comboByName(name)?.optJSONArray("models")
                 }
-                if (ids != null) for (i in 0 until ids.length()) resolveKey(ids.optString(i), out)
+                if (ids != null) for (i in 0 until ids.length()) keys.add(ids.optString(i))
             }
         }
-        return out
+        return resolveKeys(keys)
     }
 
     fun setActiveSingle(providerName: String, modelId: String) {
@@ -222,18 +370,12 @@ object Store {
         return cfg.getJSONArray("combos")
     }
 
-    fun comboByName(n: String): JSONObject? {
-        val cs = combos()
-        for (i in 0 until cs.length()) {
-            val c = cs.getJSONObject(i)
-            if (c.optString("name") == n) return c
-        }
-        return null
-    }
+    fun comboByName(n: String): JSONObject? = combosByName()[n]
 
     fun addCombo(n: String): Boolean {
         if (n.isBlank() || comboByName(n) != null) return false
         combos().put(JSONObject().put("name", n).put("models", JSONArray()))
+        invalidateIndexes()
         save()
         return true
     }
@@ -247,6 +389,7 @@ object Store {
         }
         cfg.put("combos", keep)
         if (activeComboName() == n) clearActive()
+        invalidateIndexes()
         save()
     }
 
@@ -255,6 +398,7 @@ object Store {
         val c = comboByName(old) ?: return false
         c.put("name", new)
         if (activeComboName() == old) cfg.getJSONObject("active").put("name", new)
+        invalidateIndexes()
         save()
         return true
     }
@@ -266,8 +410,23 @@ object Store {
         return out
     }
 
+    /** Usable = the model can actually be used at runtime: it exists,
+     *  is enabled, its provider exists and is enabled, and it did not
+     *  fail its last test. Same rule as the Models tab's Hide failed
+     *  (MainActivity.isUnusable). Used to keep hidden models out of
+     *  combos on every add path, not just the Add-models dialog. */
+    fun isModelUsable(key: String): Boolean {
+        val m = findModel(key) ?: return false
+        if (!m.optBoolean("enabled", true)) return false
+        if (m.optBoolean("paid", false)) return false
+        val p = providerByName(m.optString("provider")) ?: return false
+        if (!p.optBoolean("enabled", true)) return false
+        return !(m.has("lastOk") && !m.optBoolean("lastOk"))
+    }
+
     fun comboAddModel(n: String, key: String): Boolean {
         val c = comboByName(n) ?: return false
+        if (!isModelUsable(key)) return false
         val ids = c.optJSONArray("models") ?: JSONArray().also { c.put("models", it) }
         for (i in 0 until ids.length()) if (ids.optString(i) == key) return false
         ids.put(key)
@@ -361,29 +520,47 @@ object Store {
     }
 
     // ---- per-provider refresh: add new models, remove stale ones ----
-    fun refreshProviderModels(providerName: String, fresh: List<String>): Pair<Int, Int> {
+    // Returns (added, removed, addedKeys) where addedKeys are the
+    // "provider|id" keys of the newly added models, for Test-new-models.
+    // The paid flag comes from the provider's pricing (see
+    // ProviderClient.ModelInfo); it is only updated when this response
+    // actually carries pricing — absence of pricing must not clear a
+    // paid flag set by an earlier response.
+    fun refreshProviderModels(providerName: String, fresh: List<ProviderClient.ModelInfo>): Triple<Int, Int, List<String>> {
         val ms = models()
-        val keepIds = HashSet(fresh)
+        val byId = fresh.associateBy { it.id }
+        val keepIds = byId.keys
         var added = 0
         var removed = 0
+        val addedKeys = ArrayList<String>()
         val km = JSONArray()
         for (i in 0 until ms.length()) {
             val m = ms.getJSONObject(i)
             if (m.optString("provider") == providerName) {
-                if (keepIds.contains(m.optString("id"))) km.put(m) else removed++
+                if (keepIds.contains(m.optString("id"))) {
+                    val info = byId[m.optString("id")]
+                    if (info != null && info.hasPricing) m.put("paid", info.paid)
+                    km.put(m)
+                } else removed++
             } else km.put(m)
         }
-        for (id in fresh) {
+        for (info in fresh) {
             var have = false
             for (i in 0 until km.length()) {
                 val m = km.getJSONObject(i)
-                if (m.optString("provider") == providerName && m.optString("id") == id) { have = true; break }
+                if (m.optString("provider") == providerName && m.optString("id") == info.id) { have = true; break }
             }
-            if (!have) { km.put(JSONObject().put("provider", providerName).put("id", id).put("enabled", true)); added++ }
+            if (!have) {
+                km.put(JSONObject().put("provider", providerName).put("id", info.id)
+                    .put("enabled", true).put("paid", info.paid))
+                added++
+                addedKeys.add(providerName + "|" + info.id)
+            }
         }
         cfg.put("models", km)
+        invalidateIndexes()
         save()
-        return Pair(added, removed)
+        return Triple(added, removed, addedKeys)
     }
 
     // ---- log + results ----
@@ -392,14 +569,22 @@ object Store {
         save()
     }
 
-    fun bumpModel(key: String, ok: Boolean, latency: Long, err: String) {
+    // permanentFail = this failure will not be fixed by retrying
+    // (account/model-gone errors: 401/402/403/404, or a provider
+    // rejection on a 200). Stored as lastFailPermanent so Test All can
+    // skip these models next time. lastTestTs records when the model
+    // was last tested, so fresh passes can be skipped for 24h.
+    fun bumpModel(key: String, ok: Boolean, latency: Long, err: String, permanentFail: Boolean = false) {
         val m = findModel(key) ?: return
         m.put("lastOk", ok).put("lastLatencyMs", latency)
+        m.put("lastTestTs", System.currentTimeMillis())
         if (ok) {
             m.put("failStreak", 0)
+            m.put("lastFailPermanent", false)
             if (!m.optBoolean("enabled", true)) m.put("enabled", true)  // re-test pass brings it back
         } else {
             m.put("failStreak", m.optInt("failStreak", 0) + 1)
+            m.put("lastFailPermanent", permanentFail)
             if (cfg.optBoolean("autoDisable", true) && m.optInt("failStreak", 0) >= 3) m.put("enabled", false)
         }
         if (err.isNotBlank()) m.put("lastError", err)
@@ -410,6 +595,7 @@ object Store {
     fun setProviderEnabled(name: String, enabled: Boolean) {
         val p = providerByName(name) ?: return
         p.put("enabled", enabled)
+        invalidateIndexes()
         save()
     }
 
@@ -440,6 +626,7 @@ object Store {
                 if (k.startsWith(old + "|")) ids.put(j, new + "|" + k.substringAfter("|"))
             }
         }
+        invalidateIndexes()
         save()
         return true
     }
