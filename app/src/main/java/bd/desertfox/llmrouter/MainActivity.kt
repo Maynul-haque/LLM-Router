@@ -468,7 +468,7 @@ class MainActivity : Activity() {
         dhead.setPadding(dp(18), dp(22), dp(18), dp(2))
         drawer.addView(dhead)
         val dver = TextView(this)
-        dver.text = "v0.4.0"
+        dver.text = "v0.5.0"
         dver.textSize = 12f
         dver.setTextColor(DIM)
         dver.setPadding(dp(18), 0, dp(18), dp(10))
@@ -1685,7 +1685,7 @@ class MainActivity : Activity() {
         val msg = "Base URL: http://127.0.0.1:" + Store.cfg.optInt("port", 8790) + "/v1\n" +
             "API key: any value\n\n" +
             ps.length() + " providers \u00b7 " + Store.models().length() + " models \u00b7 " +
-            Store.combos().length() + " combos\n\nLLM Router v0.4.0\nsmall \u00b7 offline \u00b7 no tracking"
+            Store.combos().length() + " combos\n\nLLM Router v0.5.0\nsmall \u00b7 offline \u00b7 no tracking"
         AlertDialog.Builder(this).setTitle("About").setMessage(msg)
             .setPositiveButton("OK", null).show()
     }
