@@ -124,6 +124,7 @@ kotlinc -jvm-target 17 -include-runtime -cp android.jar \
 
 ## Notes
 
+- v0.5.2: auto-managed alias combos (one combo per model id that exists under 2+ providers, named exactly that id, keys by latency) with safe-form rotation across the model's providers — same model, provider rotates per request; custom combos untouched; greyed unusable models in expanded combo rows with a reason label.
 - v0.5.1: Log moved to the sidebar; long-press menu has Activate / Select / Hide this model; Hide-failed stays only in the bottom row; empty fetch no longer wipes models; token usage in the log; cooldown chip; combo health (usable/total); log filter; one-tap fastest combo; port change in the drawer; auto-test new models toggle.
 - v0.5.0: smart Test All (skips fresh passes and permanent fails), paid models detected from provider pricing and marked fail, Hide slow (>3s), Test new models after refresh, quick scroll, combo selector hides hidden-provider models, fallback tries every model in the chain (402 no longer stops it), `/v1/models` lists all enabled models.
 - v0.4.0: combos exposed on `/v1/models`, request routing by combo name.

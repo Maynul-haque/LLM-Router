@@ -159,6 +159,35 @@ object Store {
         }
     }
 
+    // Same-model rotation for alias combos: combo name -> next start
+    // index. In-memory only (like cooldowns) — rotation fairness
+    // across restarts is not important, and this avoids a disk write
+    // on every request.
+    private val rrIndex = HashMap<String, Int>()
+
+    // Rotate an alias combo's keys so each request starts at a
+    // different provider of the SAME model (safe-form round-robin:
+    // the model never changes mid-conversation, only the provider).
+    private fun rotateAlias(name: String, keys: List<String>): List<String> {
+        if (keys.size <= 1) return keys
+        val idx = synchronized(rrIndex) {
+            val i = (rrIndex[name] ?: 0) % keys.size
+            rrIndex[name] = (i + 1) % keys.size
+            i
+        }
+        return keys.subList(idx, keys.size) + keys.subList(0, idx)
+    }
+
+    // Keys of a named combo, rotated when it is an auto-managed
+    // alias combo. Custom combos are never rotated.
+    private fun comboKeysRotated(name: String): List<String> {
+        val c = comboByName(name) ?: return emptyList()
+        val ids = c.optJSONArray("models") ?: return emptyList()
+        val keys = ArrayList<String>()
+        for (i in 0 until ids.length()) keys.add(ids.optString(i))
+        return if (c.optBoolean("autoAlias", false)) rotateAlias(name, keys) else keys
+    }
+
     private fun providersByName(): HashMap<String, JSONObject> {
         var idx = providerIndex
         if (idx == null) {
@@ -303,10 +332,7 @@ object Store {
     // Chain for a named combo (used by /v1/chat/completions when the
     // requested model matches a combo name exposed on /v1/models).
     fun comboChain(name: String): List<Pair<JSONObject, String>> {
-        val ids = comboByName(name)?.optJSONArray("models") ?: return emptyList()
-        val keys = ArrayList<String>()
-        for (i in 0 until ids.length()) keys.add(ids.optString(i))
-        return resolveKeys(keys)
+        return resolveKeys(comboKeysRotated(name))
     }
 
     fun activeChain(): List<Pair<JSONObject, String>> {
@@ -314,12 +340,15 @@ object Store {
         val keys = ArrayList<String>()
         when (a.optString("type")) {
             "single", "combo" -> {
-                var ids = a.optJSONArray("models")
                 val name = a.optString("name", "")
                 if (a.optString("type") == "combo" && name.isNotBlank()) {
-                    ids = comboByName(name)?.optJSONArray("models")
+                    // Alias combos rotate too, so the active combo also
+                    // spreads requests across the model's providers.
+                    keys.addAll(comboKeysRotated(name))
+                } else {
+                    val ids = a.optJSONArray("models")
+                    if (ids != null) for (i in 0 until ids.length()) keys.add(ids.optString(i))
                 }
-                if (ids != null) for (i in 0 until ids.length()) keys.add(ids.optString(i))
             }
         }
         return resolveKeys(keys)
@@ -400,6 +429,10 @@ object Store {
     fun renameCombo(old: String, new: String): Boolean {
         if (new.isBlank() || (comboByName(new) != null && old != new)) return false
         val c = comboByName(old) ?: return false
+        // Renaming an alias combo would break the name == model id
+        // rule (the rebuild would recreate it and leave the renamed
+        // one behind as a stale custom combo).
+        if (c.optBoolean("autoAlias", false)) return false
         c.put("name", new)
         if (activeComboName() == old) cfg.getJSONObject("active").put("name", new)
         invalidateIndexes()
@@ -412,6 +445,56 @@ object Store {
         val out = ArrayList<String>()
         for (i in 0 until ids.length()) out.add(ids.optString(i))
         return out
+    }
+
+    // ---- alias combos (v0.5.2) ----
+    // Auto-managed alias combos: one combo per bare model id that
+    // exists under 2+ providers, named exactly that id, keys ordered
+    // by latency (fastest first, untested last). RikkaHub asks for
+    // the bare model id and gets whichever provider currently serves
+    // it, rotating across providers (see rotateAlias). Custom combos
+    // are never touched: if a combo with that name already exists
+    // and is not an alias combo, it is left alone. Alias combos
+    // that no longer qualify (< 2 usable rows) are removed.
+    // Diff-guarded: nothing is written when the desired state
+    // already holds, so calling this on every refresh() is cheap.
+    fun rebuildAliasCombos() {
+        val byId = HashMap<String, ArrayList<Pair<String, Long>>>()
+        val ms = models()
+        for (i in 0 until ms.length()) {
+            val m = ms.getJSONObject(i)
+            val key = m.optString("provider") + "|" + m.optString("id")
+            if (!isModelUsable(key)) continue
+            val id = m.optString("id")
+            if (id.isBlank()) continue
+            val lat = m.optLong("lastLatencyMs", Long.MAX_VALUE)
+            byId.getOrPut(id) { ArrayList() }.add(Pair(key, lat))
+        }
+        val desired = HashMap<String, List<String>>()
+        for ((id, rows) in byId) {
+            if (rows.map { it.first.substringBefore("|") }.toSet().size < 2) continue
+            desired[id] = rows.sortedBy { it.second }.map { it.first }
+        }
+        val cs = combos()
+        val names = ArrayList<String>()
+        for (i in 0 until cs.length()) names.add(cs.getJSONObject(i).optString("name"))
+        for (n in names) {
+            val c = comboByName(n) ?: continue
+            if (c.optBoolean("autoAlias", false) && !desired.containsKey(n)) removeCombo(n)
+        }
+        for ((id, keys) in desired) {
+            val c = comboByName(id)
+            if (c == null) {
+                if (addCombo(id)) {
+                    comboByName(id)?.put("autoAlias", true)
+                    comboSet(id, keys)
+                    save()
+                }
+            } else if (c.optBoolean("autoAlias", false)) {
+                if (comboKeys(id) != keys) comboSet(id, keys)
+            }
+            // else: a custom combo owns this name — leave it alone
+        }
     }
 
     /** Usable = the model can actually be used at runtime: it exists,
@@ -431,6 +514,10 @@ object Store {
 
     fun comboAddModel(n: String, key: String): Boolean {
         val c = comboByName(n) ?: return false
+        // Alias combos are auto-managed — hand-adding a model would
+        // be overwritten by the next rebuild, so refuse it here
+        // (covers the dialog and the long-press "Add to combo" path).
+        if (c.optBoolean("autoAlias", false)) return false
         if (!isModelUsable(key)) return false
         val ids = c.optJSONArray("models") ?: JSONArray().also { c.put("models", it) }
         for (i in 0 until ids.length()) if (ids.optString(i) == key) return false

@@ -469,7 +469,7 @@ class MainActivity : Activity() {
         dhead.setPadding(dp(18), dp(22), dp(18), dp(2))
         drawer.addView(dhead)
         val dver = TextView(this)
-        dver.text = "v0.5.1"
+        dver.text = "v0.5.2"
         dver.textSize = 12f
         dver.setTextColor(DIM)
         dver.setPadding(dp(18), 0, dp(18), dp(10))
@@ -955,6 +955,9 @@ class MainActivity : Activity() {
 
     private fun refresh() {
         sortedKeysDirty = true
+        // Keep auto-managed alias combos in sync with the models
+        // (diff-guarded inside, so this is cheap in steady state).
+        Store.rebuildAliasCombos()
         provCounts.clear()
         val ps = Store.providers()
         val msAll = Store.models()
@@ -1053,7 +1056,10 @@ class MainActivity : Activity() {
             val total = ids.length()
             var usable = 0
             for (j in 0 until total) if (Store.isModelUsable(ids.optString(j))) usable++
-            chip.text = if (active) "ACTIVE \u00b7 " + usable + "/" + total else "" + usable + "/" + total + " usable"
+            val isAlias = combo.optBoolean("autoAlias", false)
+            chip.text = if (active) "ACTIVE \u00b7 " + usable + "/" + total
+                else if (isAlias) "auto \u00b7 " + usable + "/" + total + " usable"
+                else "" + usable + "/" + total + " usable"
             chip.textSize = 12f
             chip.setTextColor(if (active) 0xFF0D0D11.toInt() else DIM)
             chip.setPadding(dp(8), dp(3), dp(8), dp(3))
@@ -1072,6 +1078,9 @@ class MainActivity : Activity() {
 
     private fun buildExpanded(card: LinearLayout, name: String) {
         val keys = ArrayList(Store.comboKeys(name))
+        // Alias combos are auto-managed: rows are read-only, no
+        // reorder/remove buttons (the rebuild owns the list).
+        val readOnly = Store.comboByName(name)?.optBoolean("autoAlias", false) == true
         val wrap = LinearLayout(this)
         wrap.orientation = LinearLayout.VERTICAL
         wrap.setPadding(0, dp(8), 0, 0)
@@ -1129,7 +1138,7 @@ class MainActivity : Activity() {
                 val idx = keys.indexOf(key).let { if (it < 0) rIdx else it }
                 if (idx > 0 && Store.comboMove(name, idx, -1)) refresh()
             }
-            r.addView(up)
+            if (!readOnly) r.addView(up)
             val down = TextView(this)
             down.text = "\u25BC"
             down.textSize = 13f
@@ -1140,7 +1149,7 @@ class MainActivity : Activity() {
                 val idx = keys.indexOf(key).let { if (it < 0) rIdx else it }
                 if (idx >= 0 && idx < keys.size - 1 && Store.comboMove(name, idx, +1)) refresh()
             }
-            r.addView(down)
+            if (!readOnly) r.addView(down)
             val x = TextView(this)
             x.text = "\u2715"
             x.textSize = 14f
@@ -1151,7 +1160,7 @@ class MainActivity : Activity() {
                 Store.comboRemoveAt(name, keys.indexOf(key).let { if (it < 0) rIdx else it })
                 refresh()
             }
-            r.addView(x)
+            if (!readOnly) r.addView(x)
             wrap.addView(r)
         }
         card.addView(wrap)
@@ -1180,6 +1189,12 @@ class MainActivity : Activity() {
     // ================= dialogs / actions =================
 
     private fun comboMenu(name: String) {
+        // Alias combos are auto-managed — no Add / Sort / Rename /
+        // Delete; they rebuild themselves from the models.
+        if (Store.comboByName(name)?.optBoolean("autoAlias", false) == true) {
+            Toast.makeText(this, "Auto-managed alias combo — same model from all providers, rebuilt automatically", Toast.LENGTH_LONG).show()
+            return
+        }
         val opts = arrayOf("Add models", "Sort speed", "Rename", "Delete")
         AlertDialog.Builder(this)
             .setTitle(name)
@@ -1426,7 +1441,11 @@ class MainActivity : Activity() {
     private fun chooseComboFor(key: String) {
         val cs = Store.combos()
         val names = ArrayList<String>()
-        for (i in 0 until cs.length()) names.add(cs.getJSONObject(i).optString("name"))
+        for (i in 0 until cs.length()) {
+            // Alias combos are auto-managed — never hand-add to them.
+            if (cs.getJSONObject(i).optBoolean("autoAlias", false)) continue
+            names.add(cs.getJSONObject(i).optString("name"))
+        }
         val items = names.toTypedArray() + arrayOf("+ New combo\u2026")
         AlertDialog.Builder(this)
             .setTitle("Add to which combo?")
@@ -1897,7 +1916,7 @@ class MainActivity : Activity() {
         val msg = "Base URL: http://127.0.0.1:" + Store.cfg.optInt("port", 8790) + "/v1\n" +
             "API key: any value\n\n" +
             ps.length() + " providers \u00b7 " + Store.models().length() + " models \u00b7 " +
-            Store.combos().length() + " combos\n\nLLM Router v0.5.1\nsmall \u00b7 offline \u00b7 no tracking"
+            Store.combos().length() + " combos\n\nLLM Router v0.5.2\nsmall \u00b7 offline \u00b7 no tracking"
         AlertDialog.Builder(this).setTitle("About").setMessage(msg)
             .setPositiveButton("OK", null).show()
     }
