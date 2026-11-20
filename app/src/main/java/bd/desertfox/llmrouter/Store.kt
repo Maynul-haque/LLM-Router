@@ -9,13 +9,14 @@ import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.TimeUnit
 
 class LogEntry(val ts: Long, val provider: String, val model: String,
-               val status: Int, val latencyMs: Long, val error: String) {
+               val status: Int, val latencyMs: Long, val error: String, val tokens: Int = 0) {
     fun toJson(): JSONObject = JSONObject()
         .put("ts", ts).put("provider", provider).put("model", model)
-        .put("status", status).put("latencyMs", latencyMs).put("error", error)
+        .put("status", status).put("latencyMs", latencyMs).put("error", error).put("tokens", tokens)
     companion object {
         fun from(j: JSONObject) = LogEntry(j.optLong("ts"), j.optString("provider"),
-            j.optString("model"), j.optInt("status"), j.optLong("latencyMs"), j.optString("error"))
+            j.optString("model"), j.optInt("status"), j.optLong("latencyMs"), j.optString("error"),
+            j.optInt("tokens", 0))
     }
 }
 
@@ -47,6 +48,7 @@ object Store {
         if (!cfg.has("combos")) cfg.put("combos", JSONArray())
         if (!cfg.has("active")) cfg.put("active", JSONObject().put("type", "none"))
         if (!cfg.has("autoDisable")) cfg.put("autoDisable", true)
+        if (!cfg.has("autoTestNew")) cfg.put("autoTestNew", false)
         if (!cfg.has("port")) cfg.put("port", 8790)
     }
 
@@ -262,6 +264,7 @@ object Store {
         for (i in 0 until ms.length()) {
             val m = ms.getJSONObject(i)
             val key = m.optString("provider") + "|" + m.optString("id")
+            if (m.optBoolean("hidden", false)) continue
             if (!m.optBoolean("enabled", true)) continue
             val p = providerByName(m.optString("provider")) ?: continue
             if (!p.optBoolean("enabled", true)) continue
@@ -272,6 +275,7 @@ object Store {
 
     private fun resolveKey(key: String, out: MutableList<Pair<JSONObject, String>>, skipCooled: Boolean) {
         val m = findModel(key) ?: return
+        if (m.optBoolean("hidden", false)) return
         if (!m.optBoolean("enabled", true)) return
         val p = providerByName(m.optString("provider")) ?: return
         if (!p.optBoolean("enabled", true)) return
@@ -417,6 +421,7 @@ object Store {
      *  combos on every add path, not just the Add-models dialog. */
     fun isModelUsable(key: String): Boolean {
         val m = findModel(key) ?: return false
+        if (m.optBoolean("hidden", false)) return false
         if (!m.optBoolean("enabled", true)) return false
         if (m.optBoolean("paid", false)) return false
         val p = providerByName(m.optString("provider")) ?: return false
@@ -527,6 +532,11 @@ object Store {
     // actually carries pricing — absence of pricing must not clear a
     // paid flag set by an earlier response.
     fun refreshProviderModels(providerName: String, fresh: List<ProviderClient.ModelInfo>): Triple<Int, Int, List<String>> {
+        // Empty list = the provider answered but listed nothing (outage,
+        // key problem, half-broken relay). Keep the stored models instead
+        // of wiping them: a refresh must never delete everything on a
+        // bad day. The user can still remove models by hand.
+        if (fresh.isEmpty()) return Triple(0, 0, emptyList())
         val ms = models()
         val byId = fresh.associateBy { it.id }
         val keepIds = byId.keys
@@ -566,6 +576,16 @@ object Store {
     // ---- log + results ----
     fun addLog(e: LogEntry) {
         synchronized(log) { log.add(e); while (log.size > LOG_CAP) log.removeAt(0) }
+        save()
+    }
+
+    // Total tokens used by one model, summed over every served request
+    // (see HttpServer usage parsing). Stored on the model itself, so it
+    // survives restarts; the debounced save() keeps the write cheap.
+    fun addTokens(key: String, n: Int) {
+        if (n <= 0) return
+        val m = findModel(key) ?: return
+        m.put("usedTokens", m.optLong("usedTokens", 0L) + n)
         save()
     }
 

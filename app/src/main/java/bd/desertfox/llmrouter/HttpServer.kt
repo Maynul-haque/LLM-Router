@@ -201,6 +201,46 @@ class HttpServer(private val port: Int) {
         respond(out, 200, "application/json", j.toString().toByteArray())
     }
 
+    // Token usage, when the provider reports it: non-streaming
+    // responses carry a top-level "usage" object; streaming ones send
+    // it in a final SSE chunk (only when the client asked for
+    // stream_options.include_usage). Absent usage means "unknown",
+    // never an invented number — those requests simply show no token
+    // count in the log.
+    private fun parseUsageTokens(text: String): Int {
+        if (!text.contains("\"usage\"")) return 0
+        return try {
+            val u = JSONObject(text).optJSONObject("usage") ?: return 0
+            val total = u.optInt("total_tokens", 0)
+            if (total > 0) total else u.optInt("prompt_tokens", 0) + u.optInt("completion_tokens", 0)
+        } catch (e: Exception) { 0 }
+    }
+
+    private fun chunkHasUsage(buf: ByteArray, n: Int): Boolean {
+        // Byte-level search for "usage" so the 8 KB chunk is only
+        // turned into a String when it actually carries usage.
+        val needle = "usage".toByteArray(Charsets.ISO_8859_1)
+        outer@ for (i in 0..n - needle.size) {
+            for (j in needle.indices) if (buf[i + j] != needle[j]) continue@outer
+            return true
+        }
+        return false
+    }
+
+    private fun parseStreamUsage(buf: ByteArray, n: Int): Int {
+        val text = String(buf, 0, n, Charsets.UTF_8)
+        var found = 0
+        for (line in text.lines()) {
+            val t = line.trim()
+            if (!t.startsWith("data:")) continue
+            val payload = t.removePrefix("data:").trim()
+            if (!payload.startsWith("{")) continue
+            val v = parseUsageTokens(payload)
+            if (v > 0) found = v
+        }
+        return found
+    }
+
     private fun handleChat(out: BufferedOutputStream, req: Req) {
         val j = try { JSONObject(String(req.body, Charsets.UTF_8)) } catch (e: Exception) {
             respond(out, 400, "application/json",
@@ -252,8 +292,6 @@ class HttpServer(private val port: Int) {
                 val r = ProviderClient.chat(p, m, j, stream, 600000)
                 val dt = System.currentTimeMillis() - t0
                 if (r.status in 200..299) {
-                    Store.addLog(LogEntry(System.currentTimeMillis(), pname, m, r.status, dt, ""))
-                    Store.bumpModel(key, true, dt, "")
                     if (stream) {
                         val head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n" +
                             "Cache-Control: no-cache\r\nConnection: close\r\n\r\n"
@@ -263,20 +301,32 @@ class HttpServer(private val port: Int) {
                         // client disconnects mid-stream, so the pooled
                         // provider connection is released (same leak as
                         // the non-streaming path used to have).
+                        var tokens = 0
                         try {
                             val ins = r.stream!!
                             val buf = ByteArray(8192)
                             while (true) {
                                 val n = try { ins.read(buf) } catch (e: Exception) { break }
                                 if (n < 0) break
+                                if (tokens == 0 && chunkHasUsage(buf, n)) {
+                                    tokens = parseStreamUsage(buf, n)
+                                }
                                 out.write(buf, 0, n)
                                 out.flush()
                             }
                         } finally {
                             r.close()
                         }
+                        if (tokens > 0) Store.addTokens(key, tokens)
+                        Store.addLog(LogEntry(System.currentTimeMillis(), pname, m, r.status, dt, "", tokens))
+                        Store.bumpModel(key, true, dt, "")
                     } else {
-                        respond(out, 200, r.contentType, r.body ?: ByteArray(0))
+                        val body = r.body ?: ByteArray(0)
+                        val tokens = parseUsageTokens(String(body, Charsets.UTF_8))
+                        if (tokens > 0) Store.addTokens(key, tokens)
+                        Store.addLog(LogEntry(System.currentTimeMillis(), pname, m, r.status, dt, "", tokens))
+                        Store.bumpModel(key, true, dt, "")
+                        respond(out, 200, r.contentType, body)
                     }
                     return
                 }
