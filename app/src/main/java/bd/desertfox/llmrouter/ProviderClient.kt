@@ -25,7 +25,15 @@ object ProviderClient {
         return out.toByteArray()
     }
 
-    fun listModels(p: JSONObject): List<String> {
+    /** One entry from a provider's /models list. `paid` is true when the
+     *  provider reports a non-zero price for the model (OpenRouter-style
+     *  pricing object). Providers that report no pricing at all (e.g.
+     *  Groq) come back paid=false, hasPricing=false — that means
+     *  "unknown", not "free", so a model is never marked paid on the
+     *  basis of a missing pricing object. */
+    class ModelInfo(val id: String, val paid: Boolean, val hasPricing: Boolean)
+
+    fun listModels(p: JSONObject): List<ModelInfo> {
         val c = URL(p.optString("baseUrl") + "/models").openConnection() as HttpURLConnection
         c.connectTimeout = 15000
         c.readTimeout = 30000
@@ -44,11 +52,23 @@ object ProviderClient {
         val body = c.inputStream.use { readBounded(it, MAX_MODELS_RESPONSE_BYTES) }
         val j = JSONObject(String(body, Charsets.UTF_8))
         val data = j.optJSONArray("data") ?: throw RuntimeException("no data[] in response")
-        val out = ArrayList<String>()
+        val out = ArrayList<ModelInfo>()
         for (i in 0 until data.length()) {
             val m = data.optJSONObject(i) ?: continue
             val id = m.optString("id")
-            if (id.isNotBlank()) out.add(id)
+            if (id.isBlank()) continue
+            val pr = m.optJSONObject("pricing")
+            var paid = false
+            var hasPricing = false
+            if (pr != null) {
+                hasPricing = true
+                // Values may be strings ("0.0001") or numbers (0.0001);
+                // toString() covers both, and "null" parses to null.
+                val prompt = pr.opt("prompt")?.toString()?.toDoubleOrNull() ?: 0.0
+                val completion = pr.opt("completion")?.toString()?.toDoubleOrNull() ?: 0.0
+                paid = prompt > 0 || completion > 0
+            }
+            out.add(ModelInfo(id, paid, hasPricing))
         }
         return out
     }

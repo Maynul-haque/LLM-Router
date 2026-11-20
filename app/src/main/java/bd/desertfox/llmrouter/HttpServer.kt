@@ -187,8 +187,11 @@ class HttpServer(private val port: Int) {
                     .put("owned_by", "LLM Router combo"))
             }
         }
-        var chain = Store.activeChain()
-        if (chain.isEmpty()) chain = Store.enabledChain()
+        // Expose every enabled model, not just the active chain: clients
+        // like RikkaHub can only pick models they see here, so models
+        // outside the active combo used to be unusable even though they
+        // were tested and fast. Combos still come first.
+        val chain = Store.enabledChain()
         for ((p, m) in chain) {
             if (seen.add(m)) {
                 data.put(JSONObject().put("id", m).put("object", "model").put("owned_by", p.optString("name")))
@@ -206,10 +209,28 @@ class HttpServer(private val port: Int) {
         }
         val stream = j.optBoolean("stream", false)
         // Requested model matching a combo name -> that combo's chain
-        // (with per-model fallback). Anything else keeps the active chain.
+        // (with per-model fallback). A single model id -> that model
+        // first, then the active chain as fallback (it used to be
+        // ignored entirely, so models outside the active combo could
+        // never be used from RikkaHub even when listed on /v1/models).
+        // Anything else keeps the active chain, and if that resolves
+        // empty (e.g. its models were all auto-disabled) the whole
+        // enabled set is tried before giving up with 503.
         val want = j.optString("model", "").trim()
         var chain = if (want.isNotBlank()) Store.comboChain(want) else emptyList()
+        if (chain.isEmpty() && want.isNotBlank()) {
+            val single = if (want.contains("|")) {
+                val p = Store.providerByName(want.substringBefore("|"))
+                val m = Store.findModel(want)
+                if (p != null && m != null && m.optBoolean("enabled", true) &&
+                    p.optBoolean("enabled", true)) Pair(p, want.substringAfter("|")) else null
+            } else Store.findEnabledModelById(want)
+            if (single != null) {
+                chain = listOf(single) + Store.activeChain().filter { it != single }
+            }
+        }
         if (chain.isEmpty()) chain = Store.activeChain()
+        if (chain.isEmpty()) chain = Store.enabledChain()
         if (chain.isEmpty()) {
             respond(out, 503, "application/json",
                 "{\"error\":{\"message\":\"no active model. open LLM Router and activate one\"}}".toByteArray())
@@ -217,8 +238,14 @@ class HttpServer(private val port: Int) {
         }
         var lastErr = ""
         var lastCode = 502
+        // Providers whose account-level error (401/402/403) already
+        // failed in this request: their other models use the same key
+        // and account, so they would fail identically — skip them and
+        // try other providers instead of burning battery and data.
+        val deadProviders = HashSet<String>()
         for ((p, m) in chain) {
             val pname = p.optString("name")
+            if (deadProviders.contains(pname)) continue
             val key = pname + "|" + m
             val t0 = System.currentTimeMillis()
             try {
@@ -256,19 +283,16 @@ class HttpServer(private val port: Int) {
                 lastErr = String(r.body ?: ByteArray(0), Charsets.UTF_8).take(300)
                 lastCode = r.status
                 Store.addLog(LogEntry(System.currentTimeMillis(), pname, m, r.status, dt, lastErr))
-                Store.bumpModel(key, false, dt, lastErr)
-                val errBody = r.body ?: ByteArray(0)
-                val errCt = r.contentType
+                Store.bumpModel(key, false, dt, lastErr,
+                    permanentFail = (r.status == 401 || r.status == 402 || r.status == 403))
                 r.close()
                 if (r.status == 429) Store.markCooldown(key)
-                // Error-class-aware fallback: only 429 and 5xx are worth
-                // retrying on the next model. A 4xx (bad key, unknown
-                // model, bad payload) is permanent for this request —
-                // retrying the whole chain would burn battery and data
-                // for nothing, so return the provider's error as-is.
-                if (r.status == 429 || r.status in 500..599) continue
-                respond(out, r.status, errCt, errBody)
-                return
+                if (r.status == 401 || r.status == 402 || r.status == 403) deadProviders.add(pname)
+                // Fallback tries the next model on ANY error now: the
+                // old code returned immediately on 4xx, so a 402
+                // (e.g. OpenRouter out of credits) never reached the
+                // other providers in the combo. Only same-provider
+                // account errors are skipped (deadProviders above).
             } catch (e: Exception) {
                 val dt = System.currentTimeMillis() - t0
                 lastErr = (e.message ?: e.toString()).take(300)

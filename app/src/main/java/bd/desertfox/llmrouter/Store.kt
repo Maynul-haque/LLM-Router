@@ -249,6 +249,13 @@ object Store {
 
     fun findModel(key: String): JSONObject? = modelsByKey()[key]
 
+    /** First enabled model with this id, any provider — for /v1/chat/completions
+     *  when a client (e.g. RikkaHub) asks for a single model by id. */
+    fun findEnabledModelById(id: String): Pair<JSONObject, String>? {
+        for ((p, m) in enabledChain()) if (m == id) return Pair(p, m)
+        return null
+    }
+
     fun enabledChain(): List<Pair<JSONObject, String>> {
         val out = ArrayList<Pair<JSONObject, String>>()
         val ms = models()
@@ -403,8 +410,23 @@ object Store {
         return out
     }
 
+    /** Usable = the model can actually be used at runtime: it exists,
+     *  is enabled, its provider exists and is enabled, and it did not
+     *  fail its last test. Same rule as the Models tab's Hide failed
+     *  (MainActivity.isUnusable). Used to keep hidden models out of
+     *  combos on every add path, not just the Add-models dialog. */
+    fun isModelUsable(key: String): Boolean {
+        val m = findModel(key) ?: return false
+        if (!m.optBoolean("enabled", true)) return false
+        if (m.optBoolean("paid", false)) return false
+        val p = providerByName(m.optString("provider")) ?: return false
+        if (!p.optBoolean("enabled", true)) return false
+        return !(m.has("lastOk") && !m.optBoolean("lastOk"))
+    }
+
     fun comboAddModel(n: String, key: String): Boolean {
         val c = comboByName(n) ?: return false
+        if (!isModelUsable(key)) return false
         val ids = c.optJSONArray("models") ?: JSONArray().also { c.put("models", it) }
         for (i in 0 until ids.length()) if (ids.optString(i) == key) return false
         ids.put(key)
@@ -498,30 +520,47 @@ object Store {
     }
 
     // ---- per-provider refresh: add new models, remove stale ones ----
-    fun refreshProviderModels(providerName: String, fresh: List<String>): Pair<Int, Int> {
+    // Returns (added, removed, addedKeys) where addedKeys are the
+    // "provider|id" keys of the newly added models, for Test-new-models.
+    // The paid flag comes from the provider's pricing (see
+    // ProviderClient.ModelInfo); it is only updated when this response
+    // actually carries pricing — absence of pricing must not clear a
+    // paid flag set by an earlier response.
+    fun refreshProviderModels(providerName: String, fresh: List<ProviderClient.ModelInfo>): Triple<Int, Int, List<String>> {
         val ms = models()
-        val keepIds = HashSet(fresh)
+        val byId = fresh.associateBy { it.id }
+        val keepIds = byId.keys
         var added = 0
         var removed = 0
+        val addedKeys = ArrayList<String>()
         val km = JSONArray()
         for (i in 0 until ms.length()) {
             val m = ms.getJSONObject(i)
             if (m.optString("provider") == providerName) {
-                if (keepIds.contains(m.optString("id"))) km.put(m) else removed++
+                if (keepIds.contains(m.optString("id"))) {
+                    val info = byId[m.optString("id")]
+                    if (info != null && info.hasPricing) m.put("paid", info.paid)
+                    km.put(m)
+                } else removed++
             } else km.put(m)
         }
-        for (id in fresh) {
+        for (info in fresh) {
             var have = false
             for (i in 0 until km.length()) {
                 val m = km.getJSONObject(i)
-                if (m.optString("provider") == providerName && m.optString("id") == id) { have = true; break }
+                if (m.optString("provider") == providerName && m.optString("id") == info.id) { have = true; break }
             }
-            if (!have) { km.put(JSONObject().put("provider", providerName).put("id", id).put("enabled", true)); added++ }
+            if (!have) {
+                km.put(JSONObject().put("provider", providerName).put("id", info.id)
+                    .put("enabled", true).put("paid", info.paid))
+                added++
+                addedKeys.add(providerName + "|" + info.id)
+            }
         }
         cfg.put("models", km)
         invalidateIndexes()
         save()
-        return Pair(added, removed)
+        return Triple(added, removed, addedKeys)
     }
 
     // ---- log + results ----
@@ -530,14 +569,22 @@ object Store {
         save()
     }
 
-    fun bumpModel(key: String, ok: Boolean, latency: Long, err: String) {
+    // permanentFail = this failure will not be fixed by retrying
+    // (account/model-gone errors: 401/402/403/404, or a provider
+    // rejection on a 200). Stored as lastFailPermanent so Test All can
+    // skip these models next time. lastTestTs records when the model
+    // was last tested, so fresh passes can be skipped for 24h.
+    fun bumpModel(key: String, ok: Boolean, latency: Long, err: String, permanentFail: Boolean = false) {
         val m = findModel(key) ?: return
         m.put("lastOk", ok).put("lastLatencyMs", latency)
+        m.put("lastTestTs", System.currentTimeMillis())
         if (ok) {
             m.put("failStreak", 0)
+            m.put("lastFailPermanent", false)
             if (!m.optBoolean("enabled", true)) m.put("enabled", true)  // re-test pass brings it back
         } else {
             m.put("failStreak", m.optInt("failStreak", 0) + 1)
+            m.put("lastFailPermanent", permanentFail)
             if (cfg.optBoolean("autoDisable", true) && m.optInt("failStreak", 0) >= 3) m.put("enabled", false)
         }
         if (err.isNotBlank()) m.put("lastError", err)

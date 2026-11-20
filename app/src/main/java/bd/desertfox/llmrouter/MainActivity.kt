@@ -43,6 +43,15 @@ class MainActivity : Activity() {
     private val selected = HashSet<String>()
     private var expandedCombo: String? = null
 
+    // A pass younger than this is "fresh" — Test All skips it.
+    private val PASS_FRESH_MS = 24L * 60 * 60 * 1000
+    // A passed model slower than this counts as slow for Hide slow.
+    private val SLOW_MS = 3000L
+
+    // Models added by the last refresh/fetch, not yet tested. Set on
+    // the UI thread only; Test new models / Test all clear it.
+    private var pendingNewTestKeys = ArrayList<String>()
+
     private val BG = 0xFF0D0D11.toInt()
     private val CARD = 0xFF1B1B23.toInt()
     private val ROWBG = 0xFF20202A.toInt()
@@ -64,6 +73,8 @@ class MainActivity : Activity() {
     private lateinit var progressRow: LinearLayout
     private lateinit var progressBar: ProgressBar
     private lateinit var progressText: TextView
+    private lateinit var testNewRow: LinearLayout
+    private lateinit var testNewBtn: TextView
     @Volatile private var testing = false
     @Volatile private var fetching = false
     private lateinit var pPanel: LinearLayout
@@ -345,6 +356,10 @@ class MainActivity : Activity() {
         modelsList = ListView(this)
         modelsList.divider = android.graphics.drawable.ColorDrawable(Color.TRANSPARENT)
         modelsList.dividerHeight = dp(6)
+        // Quick scroll: the list can hold hundreds of models, so the
+        // fast-scroll thumb is always visible for dragging through it.
+        modelsList.isFastScrollEnabled = true
+        modelsList.isFastScrollAlwaysVisible = true
         modelsList.setPadding(dp(2), 0, dp(2), 0)
         modelsList.adapter = ModelAdapter()
         modelsList.setOnItemClickListener { _, _, pos, _ ->
@@ -376,6 +391,25 @@ class MainActivity : Activity() {
         progressText.setTextColor(DIM)
         progressRow.addView(progressText)
         mPanel.addView(progressRow)
+        // Row with the "Test new models (N)" button, shown only when a
+        // refresh/fetch added models that haven't been tested yet.
+        testNewRow = LinearLayout(this)
+        testNewRow.orientation = LinearLayout.HORIZONTAL
+        testNewRow.setPadding(0, dp(10), 0, 0)
+        testNewRow.visibility = View.GONE
+        testNewBtn = textBtn("Test new models") {
+            if (testing || fetching) {
+                Toast.makeText(this, "Already running, please wait", Toast.LENGTH_SHORT).show()
+                return@textBtn
+            }
+            val keys = ArrayList(pendingNewTestKeys)
+            pendingNewTestKeys.clear()
+            testNewRow.visibility = View.GONE
+            testBatch(keys)
+        }
+        testNewRow.addView(testNewBtn,
+            LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        mPanel.addView(testNewRow)
         modelsRow = LinearLayout(this)
         modelsRow.orientation = LinearLayout.HORIZONTAL
         modelsRow.setPadding(0, dp(10), 0, 0)
@@ -711,9 +745,13 @@ class MainActivity : Activity() {
 
     // "Unusable" for the Hide-failed filter: failed the last test,
     // disabled (by hand, or auto-disabled after 3 fails), or its
-    // provider is disabled. Any of those means RikkaHub can't use it.
+    // provider is disabled. Paid models count as unusable too: they
+    // cost money this key shouldn't spend, so Hide failed hides them
+    // and the combo selector excludes them. Any of those means
+    // RikkaHub can't use it.
     private fun isUnusable(m: JSONObject): Boolean {
         if (!m.optBoolean("enabled", true)) return true
+        if (m.optBoolean("paid", false)) return true
         val p = Store.providerByName(m.optString("provider"))
         if (p != null && !p.optBoolean("enabled", true)) return true
         return m.has("lastOk") && !m.optBoolean("lastOk")
@@ -736,11 +774,16 @@ class MainActivity : Activity() {
         modelKeys.clear()
         val q = modelQuery.lowercase()
         val hf = Store.cfg.optBoolean("hideFailed", false)
+        val hs = Store.cfg.optBoolean("hideSlow", false)
         for (k in cachedSortedKeys!!) {
             val m = modelIndex[k] ?: continue
             if (q.isNotBlank() &&
                 !(m.optString("id").lowercase().contains(q) || m.optString("provider").lowercase().contains(q))) continue
             if (hf && isUnusable(m)) continue
+            // Hide slow is a display filter only: passed models slower
+            // than SLOW_MS are hidden from the list, nothing else
+            // changes (they stay enabled, usable and in combos).
+            if (hs && m.optBoolean("lastOk", false) && m.optLong("lastLatencyMs", 0L) > SLOW_MS) continue
             modelKeys.add(k)
         }
     }
@@ -771,6 +814,17 @@ class MainActivity : Activity() {
             }
             if (hideOn) hideBtn.setTextColor(ACCENT)
             modelsRow.addView(hideBtn,
+                LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+            modelsRow.addView(space(dp(8)))
+            // Hide slow: same toggle style as Hide failed. Hides only
+            // passed models slower than SLOW_MS — a display filter, so
+            // it never disables anything or touches combos.
+            val slowOn = Store.cfg.optBoolean("hideSlow", false)
+            val slowBtn = textBtn(if (slowOn) "Show slow" else "Hide slow") {
+                Store.cfg.put("hideSlow", !slowOn); Store.save(); refresh()
+            }
+            if (slowOn) slowBtn.setTextColor(ACCENT)
+            modelsRow.addView(slowBtn,
                 LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
             modelsRow.addView(space(dp(8)))
             modelsRow.addView(textBtn("Select") { selectMode = true; selected.clear(); refresh() },
@@ -834,6 +888,15 @@ class MainActivity : Activity() {
             else -> "Active: " + raw
         }
         rebuildModelsRow()
+        // "Test new models" row: visible only while there are models
+        // added by a refresh/fetch that haven't been tested yet, and
+        // not while multi-select is open.
+        if (pendingNewTestKeys.isNotEmpty() && !selectMode) {
+            testNewBtn.text = "Test new models (" + pendingNewTestKeys.size + ")"
+            testNewRow.visibility = View.VISIBLE
+        } else {
+            testNewRow.visibility = View.GONE
+        }
     }
 
     private fun comboCard(): LinearLayout {
@@ -1046,7 +1109,15 @@ class MainActivity : Activity() {
 
     private fun addModelsDialog(name: String) {
         if (name.isBlank()) return
-        val all = sortedModelKeys()
+        // Hidden models stay hidden here too: only usable models are
+        // listed — a model that is disabled itself, belongs to a
+        // disabled (hidden) provider, or failed its last test is left
+        // out. Same definition as Hide failed (isUnusable), so what
+        // you hide in the Models tab never sneaks into a combo.
+        val all = sortedModelKeys().filter { k ->
+            val m = Store.findModel(k)
+            m != null && !isUnusable(m)
+        }
         if (all.isEmpty()) { Toast.makeText(this, "No models yet, fetch first", Toast.LENGTH_SHORT).show(); return }
         val old = HashSet(Store.comboKeys(name))
         val checked = HashMap<String, Boolean>()
@@ -1068,6 +1139,8 @@ class MainActivity : Activity() {
         val list = ListView(this)
         list.divider = android.graphics.drawable.ColorDrawable(Color.TRANSPARENT)
         list.dividerHeight = dp(2)
+        list.isFastScrollEnabled = true
+        list.isFastScrollAlwaysVisible = true
         val adapter = object : BaseAdapter() {
             override fun getCount(): Int = rows.size
             override fun getItem(p: Int): Any? = null
@@ -1225,14 +1298,22 @@ class MainActivity : Activity() {
                         .setView(box)
                         .setPositiveButton("Create") { _, _ ->
                             val n = box.text.toString().trim()
-                            if (Store.addCombo(n)) { Store.comboAddModel(n, key); expandedCombo = n; refresh() }
+                            if (Store.addCombo(n)) {
+                                if (Store.comboAddModel(n, key)) { expandedCombo = n; refresh() }
+                                else Toast.makeText(this, "Model is hidden or unusable — cannot add", Toast.LENGTH_SHORT).show()
+                            }
                             else Toast.makeText(this, "Name taken or empty", Toast.LENGTH_SHORT).show()
                         }
                         .setNegativeButton("Cancel", null)
                         .show()
                 } else {
-                    Store.comboAddModel(names[w], key)
-                    Toast.makeText(this, "Added to " + names[w], Toast.LENGTH_SHORT).show()
+                    if (Store.comboKeys(names[w]).contains(key)) {
+                        Toast.makeText(this, "Already in " + names[w], Toast.LENGTH_SHORT).show()
+                    } else if (Store.comboAddModel(names[w], key)) {
+                        Toast.makeText(this, "Added to " + names[w], Toast.LENGTH_SHORT).show()
+                    } else {
+                        Toast.makeText(this, "Model is hidden or unusable — cannot add", Toast.LENGTH_SHORT).show()
+                    }
                     refresh()
                 }
             }
@@ -1243,6 +1324,10 @@ class MainActivity : Activity() {
         if (selected.isEmpty()) { Toast.makeText(this, "Nothing selected", Toast.LENGTH_SHORT).show(); return }
         if (selected.size == 1) {
             val key = selected.iterator().next()
+            if (!Store.isModelUsable(key)) {
+                Toast.makeText(this, "Model is hidden or unusable — cannot activate", Toast.LENGTH_SHORT).show()
+                return
+            }
             val parts = key.split("|")
             if (parts.size >= 2) Store.setActiveSingle(parts[0], key.substringAfter("|"))
             selectMode = false
@@ -1250,7 +1335,15 @@ class MainActivity : Activity() {
             refresh()
             return
         }
-        val keys = ArrayList(selected)
+        // Only usable models go into the new combo — hidden provider
+        // models (or failed/disabled ones) picked up while Hide failed
+        // was off are left out, with a note instead of silently
+        // creating a combo that can't run.
+        val keys = ArrayList(selected.filter { Store.isModelUsable(it) })
+        if (keys.isEmpty()) {
+            Toast.makeText(this, "No usable models selected", Toast.LENGTH_SHORT).show()
+            return
+        }
         val box = EditText(this)
         box.hint = "combo name"
         box.setText("combo " + (Store.combos().length() + 1))
@@ -1297,19 +1390,27 @@ class MainActivity : Activity() {
         Thread {
             var added = 0
             var removed = 0
+            var addedKeys = emptyList<String>()
             var err = ""
             try {
                 val list = ProviderClient.listModels(p)
                 val r = Store.refreshProviderModels(name, list)
                 added = r.first
                 removed = r.second
+                addedKeys = r.third
             } catch (e: Exception) { err = (e.message ?: e.toString()).take(80) }
             val a = added
             val rm = removed
+            val nk = addedKeys
             val e2 = err
             runOnUiThread {
                 if (e2.isNotBlank()) Toast.makeText(this, "Refresh failed: " + e2, Toast.LENGTH_LONG).show()
-                else Toast.makeText(this, "+" + a + " new, -" + rm + " removed", Toast.LENGTH_LONG).show()
+                else {
+                    Toast.makeText(this, "+" + a + " new, -" + rm + " removed", Toast.LENGTH_LONG).show()
+                    // A refresh replaces the pending set: only these
+                    // new models still need testing.
+                    pendingNewTestKeys = ArrayList(nk)
+                }
                 refresh()
             }
         }.start()
@@ -1346,6 +1447,7 @@ class MainActivity : Activity() {
             val added = java.util.concurrent.atomic.AtomicInteger(0)
             val removed = java.util.concurrent.atomic.AtomicInteger(0)
             val failed = java.util.concurrent.atomic.AtomicInteger(0)
+            val newKeys = java.util.Collections.synchronizedList(ArrayList<String>())
             val doneProviders = java.util.concurrent.atomic.AtomicInteger(0)
             // Parallel fetch (4 threads — network-bound, this is a phone).
             // Each provider's list is fetched concurrently, then merged via
@@ -1362,6 +1464,7 @@ class MainActivity : Activity() {
                         val r = synchronized(Store) { Store.refreshProviderModels(name, list) }
                         added.addAndGet(r.first)
                         removed.addAndGet(r.second)
+                        newKeys.addAll(r.third)
                     } catch (e: Exception) { failed.incrementAndGet() }
                     finally {
                         val d = doneProviders.incrementAndGet()
@@ -1374,18 +1477,27 @@ class MainActivity : Activity() {
             val a = added.get()
             val rm = removed.get()
             val f = failed.get()
+            val nk = ArrayList(newKeys)
             fetching = false
             runOnUiThread {
                 hideProgress()
                 Toast.makeText(this, "+" + a + " new, -" + rm + " removed, " + f + " providers failed",
                     Toast.LENGTH_LONG).show()
+                // A fetch replaces the pending set: only these new
+                // models still need testing.
+                pendingNewTestKeys = nk
                 refresh()
             }
         }.start()
     }
 
-    private fun chatProbe(m: JSONObject): Triple<Boolean, Long, String> {
-        val p = Store.providerByName(m.optString("provider")) ?: return Triple(false, 0L, "no provider")
+    // A probe result. `permanent` means retrying will not help
+    // (account/model-gone errors, or a provider rejection on a 200),
+    // so Test All can skip this model next time.
+    private data class ProbeResult(val ok: Boolean, val latencyMs: Long, val err: String, val permanent: Boolean)
+
+    private fun chatProbe(m: JSONObject): ProbeResult {
+        val p = Store.providerByName(m.optString("provider")) ?: return ProbeResult(false, 0L, "no provider", true)
         val t0 = System.currentTimeMillis()
         val body = JSONObject().put("model", m.optString("id"))
             .put("messages", JSONArray().put(JSONObject()
@@ -1393,6 +1505,7 @@ class MainActivity : Activity() {
             .put("max_tokens", 1)
         var ok = false
         var err = ""
+        var permanent = false
         try {
             val r = ProviderClient.chat(p, m.optString("id"), body, false, 60000)
             val raw = String(r.body ?: ByteArray(0), Charsets.UTF_8)
@@ -1409,9 +1522,14 @@ class MainActivity : Activity() {
                     // note is kept so the user knows it was throttled.
                     ok = true
                     err = "rate limited (429)"
+                    permanent = false
                 }
                 r.status !in 200..299 -> {
                     ok = false
+                    // Account or model-gone errors are permanent:
+                    // retesting the same key/model will fail the same
+                    // way. Anything else (5xx, timeouts) is transient.
+                    permanent = r.status in setOf(400, 401, 402, 403, 404)
                     err = raw.take(120)
                 }
                 else -> {
@@ -1422,15 +1540,15 @@ class MainActivity : Activity() {
                     val content = j?.optJSONArray("choices")?.optJSONObject(0)
                         ?.optJSONObject("message")?.optString("content", "") ?: ""
                     when {
-                        topErr != null -> { ok = false; err = topErr.toString().take(120) }
-                        content.isBlank() -> { ok = false; err = "empty reply" }
+                        topErr != null -> { ok = false; permanent = true; err = topErr.toString().take(120) }
+                        content.isBlank() -> { ok = false; permanent = false; err = "empty reply" }
                         else -> ok = true
                     }
                 }
             }
             r.close()
         } catch (e: Exception) { err = (e.message ?: e.toString()).take(120) }
-        return Triple(ok, System.currentTimeMillis() - t0, err)
+        return ProbeResult(ok, System.currentTimeMillis() - t0, err, permanent)
     }
 
     private fun testBatch(keysIn: List<String>) {
@@ -1449,17 +1567,29 @@ class MainActivity : Activity() {
                 pool.submit {
                     try {
                         val m = Store.findModel(k) ?: return@submit
-                        val r = chatProbe(m)
-                        // Apply each result as it finishes (instead of
-                        // only after the whole batch): the list updates
-                        // live, and one slow model can't hold the rest
-                        // hostage. bumpModel/addLog only touch this
-                        // model's own object plus synchronized save/log.
-                        try {
-                            Store.bumpModel(k, r.first, r.second, r.third)
-                            Store.addLog(LogEntry(System.currentTimeMillis(), m.optString("provider"),
-                                m.optString("id"), if (r.first) 200 else 0, r.second, r.third))
-                        } catch (ignored: Exception) {}
+                        // Paid models are never probed: they fail even
+                        // when they would have replied well (they cost
+                        // money this key shouldn't spend), so no request
+                        // is sent at all — just mark failed instantly.
+                        if (m.optBoolean("paid", false)) {
+                            try {
+                                Store.bumpModel(k, false, 0L, "paid model", permanentFail = true)
+                                Store.addLog(LogEntry(System.currentTimeMillis(), m.optString("provider"),
+                                    m.optString("id"), 0, 0L, "paid model"))
+                            } catch (ignored: Exception) {}
+                        } else {
+                            val r = chatProbe(m)
+                            // Apply each result as it finishes (instead of
+                            // only after the whole batch): the list updates
+                            // live, and one slow model can't hold the rest
+                            // hostage. bumpModel/addLog only touch this
+                            // model's own object plus synchronized save/log.
+                            try {
+                                Store.bumpModel(k, r.ok, r.latencyMs, r.err, permanentFail = r.permanent)
+                                Store.addLog(LogEntry(System.currentTimeMillis(), m.optString("provider"),
+                                    m.optString("id"), if (r.ok) 200 else 0, r.latencyMs, r.err))
+                            } catch (ignored: Exception) {}
+                        }
                     } finally {
                         val d = done.incrementAndGet()
                         runOnUiThread {
@@ -1495,17 +1625,44 @@ class MainActivity : Activity() {
         }.start()
     }
 
+    // Smart retest decision for Test All, in order:
+    // (a) paid model already marked permanently failed -> never again;
+    //     paid but not yet marked -> true, so the batch instant-fails it.
+    // (b) never tested -> always. (c) passed -> only when the last test
+    //     is older than PASS_FRESH_MS (24h). (d) failed -> only transient
+    //     failures (429/5xx/timeout) get another chance; permanent
+    //     401/402/403/404 fails never auto-retest.
+    private fun shouldRetest(m: JSONObject): Boolean {
+        if (m.optBoolean("paid", false)) return !m.optBoolean("lastFailPermanent", false)
+        if (!m.has("lastOk")) return true
+        if (m.optBoolean("lastOk")) {
+            val ts = m.optLong("lastTestTs", 0L)
+            return System.currentTimeMillis() - ts > PASS_FRESH_MS
+        }
+        return !m.optBoolean("lastFailPermanent", false)
+    }
+
     private fun testAll() {
-        // Test every stored model, not just the ones currently visible:
-        // modelKeys is filtered by the search box / hide-failed, so the
-        // old Test all silently skipped models the user couldn't see.
-        val keys = ArrayList<String>()
+        // Test only what needs testing, not every stored model:
+        // re-probing fresh passes and permanently failed models every
+        // time wasted most of the batch. Test All covers everything,
+        // so it also clears any pending new-models set.
+        val toTest = ArrayList<String>()
+        var skipped = 0
         val ms = Store.models()
         for (i in 0 until ms.length()) {
             val m = ms.getJSONObject(i)
-            keys.add(m.optString("provider") + "|" + m.optString("id"))
+            val key = m.optString("provider") + "|" + m.optString("id")
+            if (shouldRetest(m)) toTest.add(key) else skipped++
         }
-        testBatch(keys)
+        pendingNewTestKeys.clear()
+        if (toTest.isEmpty()) {
+            Toast.makeText(this, "Nothing to test — all fresh or permanently failed", Toast.LENGTH_SHORT).show()
+            return
+        }
+        Toast.makeText(this, "Testing " + toTest.size + " models — " + skipped +
+            " skipped (fresh passes / permanent fails)", Toast.LENGTH_LONG).show()
+        testBatch(toTest)
     }
 
     private fun logDialog() {
