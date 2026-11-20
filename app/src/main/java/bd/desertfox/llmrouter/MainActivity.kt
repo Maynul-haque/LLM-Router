@@ -1086,12 +1086,35 @@ class MainActivity : Activity() {
             r.layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ROWH)
             val key = keys[i]
             val m = modelIndex[key]
+            // Unusable models in a combo are greyed out with the reason
+            // next to the name (same rule as the Models tab chip), so the
+            // "15/17 usable" count can be traced to the actual models.
+            // The ▲▼✕ buttons stay working, so a dead model can still
+            // be moved down or removed.
+            val usable = Store.isModelUsable(key)
+            val reason = when {
+                m == null -> "removed"
+                m.optBoolean("hidden", false) -> "hidden"
+                !m.optBoolean("enabled", true) -> "disabled"
+                m.optBoolean("paid", false) -> "paid"
+                Store.providerByName(m.optString("provider"))?.optBoolean("enabled", true) == false -> "provider off"
+                m.has("lastOk") && !m.optBoolean("lastOk") -> "fail"
+                else -> ""
+            }
             val t = TextView(this)
             t.text = if (m != null) m.optString("id") else key
             t.textSize = 14.5f
-            t.setTextColor(TXT)
+            t.setTextColor(if (usable) TXT else DIM)
             t.maxLines = 1
             r.addView(t, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+            if (reason.isNotBlank()) {
+                val st = TextView(this)
+                st.text = reason
+                st.textSize = 12f
+                st.setTextColor(if (reason == "fail") RED else DIM)
+                st.setPadding(dp(8), 0, dp(4), 0)
+                r.addView(st)
+            }
             // Reorder with visible buttons (the old drag-to-reorder kept a
             // shared mutable list + a delayed Runnable that raced refresh()
             // and crashed). Index is resolved at tap time; first row has no
