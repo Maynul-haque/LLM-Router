@@ -1855,8 +1855,18 @@ class MainActivity : Activity() {
             render()
         }
         render()
+        // Copy copies exactly what is on screen right now (including
+        // the active filter / Failed-only view), same clipboard pattern
+        // as the crash-log Copy button.
         AlertDialog.Builder(this).setTitle("Request log (last 60)")
-            .setView(wrap).setPositiveButton("OK", null).show()
+            .setView(wrap)
+            .setNeutralButton("Copy") { _, _ ->
+                val txt = body.text.toString()
+                val cm = getSystemService(CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                cm.setPrimaryClip(android.content.ClipData.newPlainText("LLM Router request log", txt))
+                Toast.makeText(this, "Log copied", Toast.LENGTH_SHORT).show()
+            }
+            .setPositiveButton("OK", null).show()
     }
 
     private fun aboutDialog() {
