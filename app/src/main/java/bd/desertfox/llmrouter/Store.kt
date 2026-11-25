@@ -27,6 +27,15 @@ object Store {
     val log = ArrayList<LogEntry>()
     const val LOG_CAP = 1000
 
+    // Load once; safe to call from the service too. The service
+    // (START_STICKY) can be restarted by the system in a fresh
+    // process — e.g. right after an app update while the server
+    // was ON — before any activity ever ran, so cfg must be
+    // loaded there as well or every Store.cfg access crashes.
+    fun ensureLoaded(ctx: Context) {
+        if (!::cfg.isInitialized) load(ctx)
+    }
+
     fun load(ctx: Context) {
         appCtx = ctx.applicationContext
         val f = File(ctx.filesDir, "config.json")
@@ -39,7 +48,10 @@ object Store {
         synchronized(log) {
             log.clear()
             val la = cfg.optJSONArray("log") ?: JSONArray()
-            for (i in 0 until la.length()) log.add(LogEntry.from(la.getJSONObject(i)))
+            for (i in 0 until la.length()) {
+                val o = la.optJSONObject(i) ?: continue
+                log.add(LogEntry.from(o))
+            }
         }
         save()
     }
@@ -188,7 +200,7 @@ object Store {
             idx = HashMap()
             val ps = providers()
             for (i in 0 until ps.length()) {
-                val p = ps.getJSONObject(i)
+                val p = ps.optJSONObject(i) ?: continue
                 idx[p.optString("name")] = p
             }
             providerIndex = idx
@@ -202,7 +214,7 @@ object Store {
             idx = HashMap()
             val ms = models()
             for (i in 0 until ms.length()) {
-                val m = ms.getJSONObject(i)
+                val m = ms.optJSONObject(i) ?: continue
                 idx[m.optString("provider") + "|" + m.optString("id")] = m
             }
             modelIndex = idx
@@ -216,7 +228,7 @@ object Store {
             idx = HashMap()
             val cs = combos()
             for (i in 0 until cs.length()) {
-                val c = cs.getJSONObject(i)
+                val c = cs.optJSONObject(i) ?: continue
                 idx[c.optString("name")] = c
             }
             comboIndex = idx
@@ -456,14 +468,39 @@ object Store {
     // of the removed auto combos, auto-best becomes active.
     // Diff-guarded: nothing is written when the desired state
     // already holds, so calling this on every refresh() is cheap.
+    // Never let auto-maintenance kill the app: if the stored
+    // config has a malformed entry, record the trace for the
+    // crash dialog and leave the combos alone — the rebuild
+    // retries on the next refresh().
     fun rebuildAutoBest() {
+        try {
+            rebuildAutoBestInner()
+        } catch (e: Exception) {
+            recordProblem(e)
+        }
+    }
+
+    private fun recordProblem(e: Exception) {
+        try {
+            val ctx = appCtx ?: return
+            java.io.File(ctx.filesDir, "crash_last.txt").writeText(
+                java.text.SimpleDateFormat("MM-dd HH:mm", java.util.Locale.US).format(java.util.Date()) + "\n" +
+                    e.stackTraceToString().take(2500))
+        } catch (ignored: Exception) {}
+    }
+
+    private fun rebuildAutoBestInner() {
         val wasActiveAuto = activeComboName()?.let { n ->
             n == "auto" || isAutoManaged(n)
         } ?: false
         // 1. Remove all alias combos and the old "auto" combo.
+        // optJSONObject: a malformed entry is skipped, never a crash.
         val cs = combos()
         val names = ArrayList<String>()
-        for (i in 0 until cs.length()) names.add(cs.getJSONObject(i).optString("name"))
+        for (i in 0 until cs.length()) {
+            val c = cs.optJSONObject(i) ?: continue
+            names.add(c.optString("name"))
+        }
         for (n in names) {
             val c = comboByName(n) ?: continue
             if (c.optBoolean("autoAlias", false) || n == "auto") removeCombo(n)
@@ -472,7 +509,7 @@ object Store {
         val rows = ArrayList<Pair<String, Long>>()
         val ms = models()
         for (i in 0 until ms.length()) {
-            val m = ms.getJSONObject(i)
+            val m = ms.optJSONObject(i) ?: continue
             val key = m.optString("provider") + "|" + m.optString("id")
             if (!isModelUsable(key)) continue
             if (!m.optBoolean("lastOk", false)) continue

@@ -97,14 +97,50 @@ class MainActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         installCrashCatcher()
-        Store.load(applicationContext)
-        if (Build.VERSION.SDK_INT >= 33 &&
-            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
-            requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
+        try {
+            Store.ensureLoaded(applicationContext)
+            // Left/right swipe anywhere switches Providers / Models /
+            // Combos. Horizontal fling only, so vertical scrolling
+            // is untouched; ignored while the drawer is open.
+            // Observed in dispatchTouchEvent (not consumed) so
+            // lists, rows and search boxes keep working as before.
+            tabSwipe = GestureDetector(this, object : GestureDetector.SimpleOnGestureListener() {
+                override fun onFling(e1: MotionEvent?, e2: MotionEvent, vx: Float, vy: Float): Boolean {
+                    if (e1 == null || drawerShown) return false
+                    val dx = e2.x - e1.x
+                    if (Math.abs(dx) < dp(80).toFloat() || Math.abs(dx) < Math.abs(e2.y - e1.y) * 1.5f) return false
+                    if (dx < 0 && curTab < 2) showTab(curTab + 1)
+                    else if (dx > 0 && curTab > 0) showTab(curTab - 1)
+                    return true
+                }
+            })
+            if (Build.VERSION.SDK_INT >= 33 &&
+                checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+                requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
+            }
+            setContentView(buildUi())
+            showTab(0)
+            showLastCrashIfAny()
+        } catch (e: Throwable) {
+            // Never die on launch without saying why: show the
+            // error on a plain screen the user can copy from and
+            // send in. (The crash catcher also saved it to
+            // crash_last.txt, but that dialog can never appear
+            // when the app dies before the UI exists.)
+            try {
+                java.io.File(filesDir, "crash_last.txt").writeText(
+                    java.text.SimpleDateFormat("MM-dd HH:mm", java.util.Locale.US).format(java.util.Date()) + "\n" +
+                        e.stackTraceToString().take(2500))
+            } catch (ignored: Exception) {}
+            val tv = TextView(this)
+            tv.text = "LLM Router could not start.\n\nLong-press to copy this text and send it to the developer:\n\n" +
+                e.stackTraceToString().take(2000)
+            tv.setTextIsSelectable(true)
+            tv.setTextColor(TXT)
+            tv.textSize = 13f
+            tv.setPadding(dp(16), dp(16), dp(16), dp(16))
+            setContentView(tv)
         }
-        setContentView(buildUi())
-        showTab(0)
-        showLastCrashIfAny()
     }
 
     private fun installCrashCatcher() {
@@ -470,7 +506,7 @@ class MainActivity : Activity() {
         dhead.setPadding(dp(18), dp(22), dp(18), dp(2))
         drawer.addView(dhead)
         val dver = TextView(this)
-        dver.text = "v0.5.6"
+        dver.text = "v0.5.9"
         dver.textSize = 12f
         dver.setTextColor(DIM)
         dver.setPadding(dp(18), 0, dp(18), dp(10))
@@ -783,25 +819,12 @@ class MainActivity : Activity() {
         refresh()
     }
 
-    // ================= swipe between tabs =================
-    // Left/right swipe anywhere switches Providers / Models /
-    // Combos. Horizontal fling only, so vertical scrolling is
-    // untouched; ignored while the drawer is open. Observed in
-    // dispatchTouchEvent (not consumed) so lists, rows and
-    // search boxes keep working exactly as before.
-    private val tabSwipe = GestureDetector(this, object : GestureDetector.SimpleOnGestureListener() {
-        override fun onFling(e1: MotionEvent?, e2: MotionEvent, vx: Float, vy: Float): Boolean {
-            if (e1 == null || drawerShown) return false
-            val dx = e2.x - e1.x
-            if (Math.abs(dx) < dp(80).toFloat() || Math.abs(dx) < Math.abs(e2.y - e1.y) * 1.5f) return false
-            if (dx < 0 && curTab < 2) showTab(curTab + 1)
-            else if (dx > 0 && curTab > 0) showTab(curTab - 1)
-            return true
-        }
-    })
+    // Swipe detector, created in onCreate (not as a field
+    // initializer) so nothing runs before the activity exists.
+    private var tabSwipe: GestureDetector? = null
 
     override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
-        tabSwipe.onTouchEvent(ev)
+        tabSwipe?.onTouchEvent(ev)
         return super.dispatchTouchEvent(ev)
     }
 
@@ -1903,7 +1926,7 @@ class MainActivity : Activity() {
     }
 
     private fun aboutDialog() {
-        val msg = "LLM Router v0.5.6\n\nCreator: Maynul Haque\n\nsmall \u00b7 offline \u00b7 no tracking"
+        val msg = "LLM Router v0.5.9\n\nCreator: Maynul Haque\n\nsmall \u00b7 offline \u00b7 no tracking"
         AlertDialog.Builder(this).setTitle("About").setMessage(msg)
             .setPositiveButton("OK", null).show()
     }
