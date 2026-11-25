@@ -13,6 +13,8 @@ import android.os.Build
 import android.os.Bundle
 import android.text.Editable
 import android.text.TextWatcher
+import android.view.GestureDetector
+import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
 import android.widget.AbsListView
@@ -84,7 +86,6 @@ class MainActivity : Activity() {
     private lateinit var modelsRow: LinearLayout
     private lateinit var drawer: LinearLayout
     private lateinit var scrim: View
-    private lateinit var drawerServer: TextView
     private lateinit var drawerAutoTest: TextView
     private var drawerShown = false
     // Log dialog filter state, kept across opens.
@@ -469,23 +470,13 @@ class MainActivity : Activity() {
         dhead.setPadding(dp(18), dp(22), dp(18), dp(2))
         drawer.addView(dhead)
         val dver = TextView(this)
-        dver.text = "v0.5.2"
+        dver.text = "v0.5.6"
         dver.textSize = 12f
         dver.setTextColor(DIM)
         dver.setPadding(dp(18), 0, dp(18), dp(10))
         drawer.addView(dver)
         drawer.addView(dDivider())
-        drawerServer = TextView(this)
-        drawerServer.textSize = 15f
-        drawerServer.setTextColor(TXT)
-        drawerServer.setPadding(dp(18), dp(14), dp(18), dp(14))
-        drawerServer.isClickable = true
-        drawerServer.setOnClickListener { toggleServer() }
-        drawer.addView(drawerServer)
-        drawer.addView(dDivider())
         drawer.addView(dItem("Import keys (keys.json)") { pickImport() })
-        drawer.addView(dItem("Fetch all models") { fetchModels() })
-        drawer.addView(dItem("Make fastest combo") { makeFastestCombo() })
         drawer.addView(dItem("Backup config") { backupConfig() })
         drawer.addView(dDivider())
         drawer.addView(dItem("Request log") { logDialog() })
@@ -493,7 +484,9 @@ class MainActivity : Activity() {
         drawerAutoTest = dItem(autoTestLabel()) { toggleAutoTest() }
         drawer.addView(drawerAutoTest)
         drawer.addView(dDivider())
-        drawer.addView(dItem("About / server info") { aboutDialog() })
+        drawer.addView(dItem("How to use") { howToDialog() })
+        drawer.addView(dItem("About") { aboutDialog() })
+        drawer.addView(dItem("Server info") { serverDialog() })
         drawer.visibility = View.GONE
         rootFrame.addView(drawer, FrameLayout.LayoutParams(dp(272), ViewGroup.LayoutParams.MATCH_PARENT))
 
@@ -533,7 +526,7 @@ class MainActivity : Activity() {
         serverPill.postDelayed({ refresh() }, 500)
     }
 
-    // ---- drawer actions: fastest combo, port, auto-test ----
+    // ---- drawer actions: port, auto-test ----
 
     private fun autoTestLabel(): String =
         "Auto-test new models: " + if (Store.cfg.optBoolean("autoTestNew", false)) "ON" else "OFF"
@@ -547,36 +540,10 @@ class MainActivity : Activity() {
         refresh()
     }
 
-    // One tap: build (or rebuild) a "fastest" combo from the 10 fastest
-    // models that passed their last test. Only usable models qualify;
-    // slow or failed ones never get in.
-    private fun makeFastestCombo() {
-        val scored = ArrayList<Pair<String, Long>>()
-        val ms = Store.models()
-        for (i in 0 until ms.length()) {
-            val m = ms.getJSONObject(i)
-            val key = m.optString("provider") + "|" + m.optString("id")
-            if (Store.isModelUsable(key) && m.optBoolean("lastOk", false)) {
-                scored.add(Pair(key, m.optLong("lastLatencyMs", Long.MAX_VALUE)))
-            }
-        }
-        scored.sortBy { it.second }
-        val keys = scored.take(10).map { it.first }
-        if (keys.isEmpty()) {
-            Toast.makeText(this, "No passed models yet — run Test all first", Toast.LENGTH_LONG).show()
-            return
-        }
-        if (Store.comboByName("fastest") == null) Store.addCombo("fastest")
-        Store.comboSet("fastest", keys)
-        expandedCombo = "fastest"
-        Toast.makeText(this, "fastest combo: " + keys.size + " models", Toast.LENGTH_LONG).show()
-        refresh()
-    }
-
     // Change the server port from the UI. The running server is
     // restarted on the new port (stop, brief pause so the old socket
-    // is released, start); RikkaHub's base URL must be updated to
-    // match, so the toast says so.
+    // is released, start); the base URL in your app must be updated
+    // to match, so the toast says so.
     private fun portDialog() {
         val box = EditText(this)
         box.inputType = android.text.InputType.TYPE_CLASS_NUMBER
@@ -598,7 +565,7 @@ class MainActivity : Activity() {
                         serverPill.postDelayed({ refresh() }, 500)
                     }, 600)
                 } else refresh()
-                Toast.makeText(this, "Port set to " + p + " — update the base URL in RikkaHub",
+                Toast.makeText(this, "Port set to " + p + " — update the base URL in your app",
                     Toast.LENGTH_LONG).show()
             }
             .setNegativeButton("Cancel", null).show()
@@ -816,6 +783,28 @@ class MainActivity : Activity() {
         refresh()
     }
 
+    // ================= swipe between tabs =================
+    // Left/right swipe anywhere switches Providers / Models /
+    // Combos. Horizontal fling only, so vertical scrolling is
+    // untouched; ignored while the drawer is open. Observed in
+    // dispatchTouchEvent (not consumed) so lists, rows and
+    // search boxes keep working exactly as before.
+    private val tabSwipe = GestureDetector(this, object : GestureDetector.SimpleOnGestureListener() {
+        override fun onFling(e1: MotionEvent?, e2: MotionEvent, vx: Float, vy: Float): Boolean {
+            if (e1 == null || drawerShown) return false
+            val dx = e2.x - e1.x
+            if (Math.abs(dx) < dp(80).toFloat() || Math.abs(dx) < Math.abs(e2.y - e1.y) * 1.5f) return false
+            if (dx < 0 && curTab < 2) showTab(curTab + 1)
+            else if (dx > 0 && curTab > 0) showTab(curTab - 1)
+            return true
+        }
+    })
+
+    override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
+        tabSwipe.onTouchEvent(ev)
+        return super.dispatchTouchEvent(ev)
+    }
+
     // ================= model keys + search =================
 
     private fun sortedModelKeys(): List<String> {
@@ -955,9 +944,10 @@ class MainActivity : Activity() {
 
     private fun refresh() {
         sortedKeysDirty = true
-        // Keep auto-managed alias combos in sync with the models
-        // (diff-guarded inside, so this is cheap in steady state).
-        Store.rebuildAliasCombos()
+        // Keep the single auto-managed "auto-best" combo in sync
+        // with the models (diff-guarded inside, so this is cheap
+        // in steady state).
+        Store.rebuildAutoBest()
         provCounts.clear()
         val ps = Store.providers()
         val msAll = Store.models()
@@ -974,9 +964,6 @@ class MainActivity : Activity() {
         serverPill.text = if (on) "ON" else "OFF"
         serverPill.background = cardBg(if (on) 0xFF1F3D33.toInt() else PILL_OFF)
         serverPill.setTextColor(if (on) ACCENT else DIM)
-        if (this::drawerServer.isInitialized) {
-            drawerServer.text = if (on) "Server: ON" else "Server: OFF"
-        }
         if (this::drawerAutoTest.isInitialized) {
             drawerAutoTest.text = autoTestLabel()
         }
@@ -1056,9 +1043,9 @@ class MainActivity : Activity() {
             val total = ids.length()
             var usable = 0
             for (j in 0 until total) if (Store.isModelUsable(ids.optString(j))) usable++
-            val isAlias = combo.optBoolean("autoAlias", false)
+            val isAuto = Store.isAutoManaged(name)
             chip.text = if (active) "ACTIVE \u00b7 " + usable + "/" + total
-                else if (isAlias) "auto \u00b7 " + usable + "/" + total + " usable"
+                else if (isAuto) "auto \u00b7 " + usable + "/" + total + " usable"
                 else "" + usable + "/" + total + " usable"
             chip.textSize = 12f
             chip.setTextColor(if (active) 0xFF0D0D11.toInt() else DIM)
@@ -1078,9 +1065,9 @@ class MainActivity : Activity() {
 
     private fun buildExpanded(card: LinearLayout, name: String) {
         val keys = ArrayList(Store.comboKeys(name))
-        // Alias combos are auto-managed: rows are read-only, no
+        // Auto-managed combos are read-only: rows have no
         // reorder/remove buttons (the rebuild owns the list).
-        val readOnly = Store.comboByName(name)?.optBoolean("autoAlias", false) == true
+        val readOnly = Store.isAutoManaged(name)
         val wrap = LinearLayout(this)
         wrap.orientation = LinearLayout.VERTICAL
         wrap.setPadding(0, dp(8), 0, 0)
@@ -1189,10 +1176,14 @@ class MainActivity : Activity() {
     // ================= dialogs / actions =================
 
     private fun comboMenu(name: String) {
-        // Alias combos are auto-managed — no Add / Sort / Rename /
-        // Delete; they rebuild themselves from the models.
-        if (Store.comboByName(name)?.optBoolean("autoAlias", false) == true) {
-            Toast.makeText(this, "Auto-managed alias combo — same model from all providers, rebuilt automatically", Toast.LENGTH_LONG).show()
+        // Auto-managed combos — no Add / Sort / Rename / Delete;
+        // they rebuild themselves from the models.
+        if (Store.isAutoManaged(name)) {
+            val msg = if (Store.comboByName(name)?.optBoolean("autoBest", false) == true)
+                "Auto-managed auto-best combo — models that replied successfully join automatically"
+            else
+                "Auto-managed alias combo — same model from all providers, rebuilt automatically"
+            Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
             return
         }
         val opts = arrayOf("Add models", "Sort speed", "Rename", "Delete")
@@ -1442,8 +1433,8 @@ class MainActivity : Activity() {
         val cs = Store.combos()
         val names = ArrayList<String>()
         for (i in 0 until cs.length()) {
-            // Alias combos are auto-managed — never hand-add to them.
-            if (cs.getJSONObject(i).optBoolean("autoAlias", false)) continue
+            // Auto-managed combos — never hand-add to them.
+            if (Store.isAutoManaged(cs.getJSONObject(i).optString("name"))) continue
             names.add(cs.getJSONObject(i).optString("name"))
         }
         val items = names.toTypedArray() + arrayOf("+ New combo\u2026")
@@ -1912,12 +1903,31 @@ class MainActivity : Activity() {
     }
 
     private fun aboutDialog() {
+        val msg = "LLM Router v0.5.6\n\nCreator: Maynul Haque\n\nsmall \u00b7 offline \u00b7 no tracking"
+        AlertDialog.Builder(this).setTitle("About").setMessage(msg)
+            .setPositiveButton("OK", null).show()
+    }
+
+    private fun serverDialog() {
         val ps = Store.providers()
-        val msg = "Base URL: http://127.0.0.1:" + Store.cfg.optInt("port", 8790) + "/v1\n" +
+        val msg = "Server: " + (if (HttpServerHolder.running) "ON" else "OFF") + "\n" +
+            "Base URL: http://127.0.0.1:" + Store.cfg.optInt("port", 8790) + "/v1\n" +
             "API key: any value\n\n" +
             ps.length() + " providers \u00b7 " + Store.models().length() + " models \u00b7 " +
-            Store.combos().length() + " combos\n\nLLM Router v0.5.2\nsmall \u00b7 offline \u00b7 no tracking"
-        AlertDialog.Builder(this).setTitle("About").setMessage(msg)
+            Store.combos().length() + " combos"
+        AlertDialog.Builder(this).setTitle("Server info").setMessage(msg)
+            .setPositiveButton("OK", null).show()
+    }
+
+    private fun howToDialog() {
+        val msg = "1. Add a provider: Providers tab \u2192 + Add \u2192 name, base URL, API key.\n\n" +
+            "2. Fetch models: Providers tab \u2192 Fetch all.\n\n" +
+            "3. Test: Models tab \u2192 Test all. Only models that actually reply pass.\n\n" +
+            "4. Pick a model: successful models join the auto-best combo by themselves (fastest first), or make your own combo in the Combos tab and Activate it.\n\n" +
+            "5. Start the server: tap the Server pill (or the drawer Server toggle) so it shows ON.\n\n" +
+            "6. In any OpenAI-compatible app: add a custom provider \u2014 Base URL http://127.0.0.1:" + Store.cfg.optInt("port", 8790) + "/v1, API key any value, model auto-best (or a combo name, or one model id).\n\n" +
+            "7. If a model fails or its quota runs out, the router falls back to the next one automatically. The drawer Request log shows what was tried."
+        AlertDialog.Builder(this).setTitle("How to use").setMessage(msg)
             .setPositiveButton("OK", null).show()
     }
 

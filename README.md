@@ -72,7 +72,12 @@ to the network. The server speaks the OpenAI API:
 4. On success, the provider's response is passed back unchanged.
 5. On failure, the next model in the chain is tried. A model that returns
    `429` is put on a 60-second cooldown (in memory only) and skipped by later
-   requests until it cools down.
+   requests until it cools down. A `200` that carries an error object (or an
+   empty reply) counts as a failure too: for streaming, the first chunk is
+   checked before `200` headers are sent to the client, so a quota error
+   from the first model falls back to the next model in the combo instead
+   of being shown as the answer. A model that gives no data for 30s
+   (streaming) or 60s (non-streaming) is also failed so the chain moves on.
 6. If every model fails, the last error is returned.
 
 ### What "usable" means
@@ -124,6 +129,10 @@ kotlinc -jvm-target 17 -include-runtime -cp android.jar \
 
 ## Notes
 
+- v0.5.3: combo fallback fixed for 200-with-error replies — a provider that answers 200 with an error body (e.g. free-model quota used up) or an empty reply now falls back to the next model in the combo, in streaming and non-streaming; streaming checks the first chunk before sending 200 headers; quota-like errors get a 60s cooldown; per-model timeout cut from 600s to 30s (streaming) / 60s (non-streaming). No new dependency.
+- v0.5.4: launcher icon — adaptive icon (Android 8+), teal-to-indigo gradient with a glowing cyan hub and three nodes; pure vector XML, no PNG, no new dependency.
+- v0.5.6: sidebar "Server: ON" display removed (the top ON/OFF pill still toggles the server). Left/right swipe anywhere switches the Providers / Models / Combos tabs (horizontal fling only, vertical scrolling untouched, ignored while the drawer is open). The How-to is now app-generic — no RikkaHub-specific tutorial; any OpenAI-compatible app can use the router.
+- v0.5.5: one auto-managed combo only — "auto-best". The v0.5.2 alias combos and the preinstalled "auto" combo are removed on load; auto-best holds every model that actually replied successfully (usable + lastOk), fastest first, and rebuilds itself on every refresh (new successes join, failures leave). No rotation — the order is the fallback order. Custom combos untouched; auto-best is read-only (no rename / add / sort / delete). The "Make fastest combo" drawer option is removed — auto-best does the same job automatically (all successful models, not just 10). The duplicate "Fetch all models" drawer option is removed (Providers tab → Fetch all does the same thing). "About / server info" is split into About (with Creator: Maynul Haque) and Server info, and a "How to use" summary is added to the sidebar.
 - v0.5.2: auto-managed alias combos (one combo per model id that exists under 2+ providers, named exactly that id, keys by latency) with safe-form rotation across the model's providers — same model, provider rotates per request; custom combos untouched; greyed unusable models in expanded combo rows with a reason label.
 - v0.5.1: Log moved to the sidebar; long-press menu has Activate / Select / Hide this model; Hide-failed stays only in the bottom row; empty fetch no longer wipes models; token usage in the log; cooldown chip; combo health (usable/total); log filter; one-tap fastest combo; port change in the drawer; auto-test new models toggle.
 - v0.5.0: smart Test All (skips fresh passes and permanent fails), paid models detected from provider pricing and marked fail, Hide slow (>3s), Test new models after refresh, quick scroll, combo selector hides hidden-provider models, fallback tries every model in the chain (402 no longer stops it), `/v1/models` lists all enabled models.

@@ -33,7 +33,9 @@ object Store {
         cfg = try { if (f.exists()) JSONObject(f.readText()) else JSONObject() } catch (e: Exception) { JSONObject() }
         defaults()
         invalidateIndexes()
-        ensureAutoCombo()
+        // One auto-managed combo only: rebuildAutoBest() removes the
+        // old v0.5.2 alias combos and the preinstalled "auto" combo.
+        rebuildAutoBest()
         synchronized(log) {
             log.clear()
             val la = cfg.optJSONArray("log") ?: JSONArray()
@@ -52,19 +54,11 @@ object Store {
         if (!cfg.has("port")) cfg.put("port", 8790)
     }
 
-    // Preinstalled "auto" combo: on first run (no combos yet), build one
-    // from the currently enabled chain, in its existing order, so RikkaHub
-    // users can type model "auto" and get the whole enabled set with
-    // fallback. Never touches existing combos; never created when there
-    // is nothing enabled. Persisted by load()'s existing debounced save().
-    private fun ensureAutoCombo() {
-        if (combos().length() != 0) return
-        val keys = enabledChain().map { it.first.optString("name") + "|" + it.second }
-        if (keys.isEmpty()) return
-        val ids = JSONArray()
-        for (k in keys) ids.put(k)
-        combos().put(JSONObject().put("name", "auto").put("models", ids))
-        invalidateIndexes()
+    // Auto-managed combo check: alias combos (v0.5.2, removed by the
+    // rebuild below) and the auto-best combo (v0.5.5).
+    fun isAutoManaged(n: String): Boolean {
+        val c = comboByName(n) ?: return false
+        return c.optBoolean("autoAlias", false) || c.optBoolean("autoBest", false)
     }
 
     fun save() {
@@ -429,10 +423,10 @@ object Store {
     fun renameCombo(old: String, new: String): Boolean {
         if (new.isBlank() || (comboByName(new) != null && old != new)) return false
         val c = comboByName(old) ?: return false
-        // Renaming an alias combo would break the name == model id
-        // rule (the rebuild would recreate it and leave the renamed
-        // one behind as a stale custom combo).
-        if (c.optBoolean("autoAlias", false)) return false
+        // Renaming an alias or auto-best combo would break the rebuild
+        // (it would recreate the auto one and leave the renamed one
+        // behind as a stale custom combo).
+        if (c.optBoolean("autoAlias", false) || c.optBoolean("autoBest", false)) return false
         c.put("name", new)
         if (activeComboName() == old) cfg.getJSONObject("active").put("name", new)
         invalidateIndexes()
@@ -447,53 +441,59 @@ object Store {
         return out
     }
 
-    // ---- alias combos (v0.5.2) ----
-    // Auto-managed alias combos: one combo per bare model id that
-    // exists under 2+ providers, named exactly that id, keys ordered
-    // by latency (fastest first, untested last). RikkaHub asks for
-    // the bare model id and gets whichever provider currently serves
-    // it, rotating across providers (see rotateAlias). Custom combos
-    // are never touched: if a combo with that name already exists
-    // and is not an alias combo, it is left alone. Alias combos
-    // that no longer qualify (< 2 usable rows) are removed.
+    // ---- auto-best combo (v0.5.5) ----
+    // Replaces the v0.5.2 alias combos (one combo per model id) and the
+    // preinstalled "auto" combo. There is exactly one auto-managed
+    // combo: "auto-best". It holds every model that actually replied
+    // successfully (usable + lastOk), ordered fastest first — so a
+    // model only joins after it has really answered, and a model that
+    // starts failing leaves on the next rebuild. No rotation: the
+    // order is the fallback order (fastest first). Custom combos are
+    // never touched; a custom combo that happens to be named
+    // "auto-best" is left alone, and the old "auto" combo is removed
+    // (it was the preinstalled auto combo, not a custom one — the
+    // auto-best combo takes its place). If the active combo was one
+    // of the removed auto combos, auto-best becomes active.
     // Diff-guarded: nothing is written when the desired state
     // already holds, so calling this on every refresh() is cheap.
-    fun rebuildAliasCombos() {
-        val byId = HashMap<String, ArrayList<Pair<String, Long>>>()
-        val ms = models()
-        for (i in 0 until ms.length()) {
-            val m = ms.getJSONObject(i)
-            val key = m.optString("provider") + "|" + m.optString("id")
-            if (!isModelUsable(key)) continue
-            val id = m.optString("id")
-            if (id.isBlank()) continue
-            val lat = m.optLong("lastLatencyMs", Long.MAX_VALUE)
-            byId.getOrPut(id) { ArrayList() }.add(Pair(key, lat))
-        }
-        val desired = HashMap<String, List<String>>()
-        for ((id, rows) in byId) {
-            if (rows.map { it.first.substringBefore("|") }.toSet().size < 2) continue
-            desired[id] = rows.sortedBy { it.second }.map { it.first }
-        }
+    fun rebuildAutoBest() {
+        val wasActiveAuto = activeComboName()?.let { n ->
+            n == "auto" || isAutoManaged(n)
+        } ?: false
+        // 1. Remove all alias combos and the old "auto" combo.
         val cs = combos()
         val names = ArrayList<String>()
         for (i in 0 until cs.length()) names.add(cs.getJSONObject(i).optString("name"))
         for (n in names) {
             val c = comboByName(n) ?: continue
-            if (c.optBoolean("autoAlias", false) && !desired.containsKey(n)) removeCombo(n)
+            if (c.optBoolean("autoAlias", false) || n == "auto") removeCombo(n)
         }
-        for ((id, keys) in desired) {
-            val c = comboByName(id)
-            if (c == null) {
-                if (addCombo(id)) {
-                    comboByName(id)?.put("autoAlias", true)
-                    comboSet(id, keys)
-                    save()
-                }
-            } else if (c.optBoolean("autoAlias", false)) {
-                if (comboKeys(id) != keys) comboSet(id, keys)
+        // 2. Desired members: usable models that actually replied.
+        val rows = ArrayList<Pair<String, Long>>()
+        val ms = models()
+        for (i in 0 until ms.length()) {
+            val m = ms.getJSONObject(i)
+            val key = m.optString("provider") + "|" + m.optString("id")
+            if (!isModelUsable(key)) continue
+            if (!m.optBoolean("lastOk", false)) continue
+            rows.add(Pair(key, m.optLong("lastLatencyMs", Long.MAX_VALUE)))
+        }
+        val desired = rows.sortedBy { it.second }.map { it.first }
+        // 3. Create or update auto-best.
+        val c = comboByName("auto-best")
+        if (c == null) {
+            if (addCombo("auto-best")) {
+                comboByName("auto-best")?.put("autoBest", true)
+                comboSet("auto-best", desired)
+                save()
             }
-            // else: a custom combo owns this name — leave it alone
+        } else if (c.optBoolean("autoBest", false)) {
+            if (comboKeys("auto-best") != desired) comboSet("auto-best", desired)
+        }
+        // else: a custom combo owns this name — leave it alone.
+        // 4. Keep something active if the active combo was removed.
+        if (wasActiveAuto && comboByName("auto-best")?.optBoolean("autoBest", false) == true) {
+            activateCombo("auto-best")
         }
     }
 
@@ -514,10 +514,11 @@ object Store {
 
     fun comboAddModel(n: String, key: String): Boolean {
         val c = comboByName(n) ?: return false
-        // Alias combos are auto-managed — hand-adding a model would
-        // be overwritten by the next rebuild, so refuse it here
-        // (covers the dialog and the long-press "Add to combo" path).
-        if (c.optBoolean("autoAlias", false)) return false
+        // Alias and auto-best combos are auto-managed — hand-adding a
+        // model would be overwritten by the next rebuild, so refuse
+        // it here (covers the dialog and the long-press "Add to combo"
+        // path).
+        if (c.optBoolean("autoAlias", false) || c.optBoolean("autoBest", false)) return false
         if (!isModelUsable(key)) return false
         val ids = c.optJSONArray("models") ?: JSONArray().also { c.put("models", it) }
         for (i in 0 until ids.length()) if (ids.optString(i) == key) return false

@@ -3,6 +3,7 @@ package bd.desertfox.llmrouter
 import android.util.Log
 import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
+import java.io.ByteArrayOutputStream
 import java.io.InputStream
 import java.net.InetAddress
 import java.net.ServerSocket
@@ -241,6 +242,65 @@ class HttpServer(private val port: Int) {
         return found
     }
 
+    // A 200 is not a success when the body carries an error — the Test
+    // probe already treats it that way, but /v1/chat/completions did
+    // not: a relay can answer 200 with {"error": {...}} (e.g. "This
+    // free model's quota is temporarily used up") and the router
+    // forwarded it as a success, so RikkaHub showed the error and no
+    // fallback ran. Returns the error message, or null when there is
+    // no error object.
+    private fun errorFromJsonBody(text: String): String? {
+        return try {
+            val j = JSONObject(text)
+            val e = j.opt("error") ?: return null
+            if (e === JSONObject.NULL) return null
+            if (e is JSONObject) {
+                val msg = e.optString("message", "")
+                if (msg.isNotBlank()) msg else e.toString()
+            } else e.toString()
+        } catch (e: Exception) { null }
+    }
+
+    private fun isQuotaLikeError(msg: String): Boolean {
+        val l = msg.lowercase()
+        return l.contains("quota") || l.contains("rate limit") ||
+            l.contains("rate-limited") || l.contains("temporarily") ||
+            l.contains("too many requests")
+    }
+
+    // First chunk(s) of a streaming reply: returns the error message
+    // when a data: line (or a bare JSON body) carries an error, else
+    // null. Non-JSON data lines, "[DONE]" and comments are ignored.
+    private fun errorFromSseText(text: String): String? {
+        val t = text.trim()
+        if (t.startsWith("{")) return errorFromJsonBody(t)
+        for (line in text.lines()) {
+            val s = line.trim()
+            if (!s.startsWith("data:")) continue
+            val payload = s.removePrefix("data:").trim()
+            if (payload.isEmpty() || payload == "[DONE]") continue
+            if (!payload.startsWith("{")) continue
+            val err = errorFromJsonBody(payload)
+            if (err != null) return err
+        }
+        return null
+    }
+
+    // Non-streaming body with no usable content: a choices array whose
+    // first message has blank content and no tool calls (same rule as
+    // the Test probe's "empty reply"). Bodies with no choices array
+    // are only failures when they are blank.
+    private fun isEmptyReply(text: String): Boolean {
+        return try {
+            val j = JSONObject(text)
+            val choices = j.optJSONArray("choices") ?: return text.isBlank()
+            if (choices.length() == 0) return true
+            val msg = choices.optJSONObject(0)?.optJSONObject("message") ?: return true
+            if (msg.optJSONArray("tool_calls") != null) return false
+            msg.optString("content", "").isBlank()
+        } catch (e: Exception) { false }
+    }
+
     private fun handleChat(out: BufferedOutputStream, req: Req) {
         val j = try { JSONObject(String(req.body, Charsets.UTF_8)) } catch (e: Exception) {
             respond(out, 400, "application/json",
@@ -289,21 +349,77 @@ class HttpServer(private val port: Int) {
             val key = pname + "|" + m
             val t0 = System.currentTimeMillis()
             try {
-                val r = ProviderClient.chat(p, m, j, stream, 600000)
+                // Per-read timeout, not 600s: a hanging model used to
+                // block the whole chain for 10 minutes per model, so
+                // RikkaHub gave up before fallback reached a working
+                // model. 30s for streaming (tokens arrive steadily
+                // once a model starts, so a 30s gap means it is
+                // stuck) and 60s for non-streaming (a real reply can
+                // take ~40s to generate before headers arrive).
+                val r = ProviderClient.chat(p, m, j, stream, if (stream) 30000 else 60000)
                 val dt = System.currentTimeMillis() - t0
                 if (r.status in 200..299) {
                     if (stream) {
+                        // Peek at the first chunk(s) BEFORE sending
+                        // 200 headers to RikkaHub: once headers are
+                        // sent, fallback is impossible. A provider
+                        // that answers 200 then streams an error
+                        // (quota used up, model unavailable) must
+                        // fail here so the next model in the combo
+                        // is tried. Up to 3 reads are buffered to
+                        // skip keep-alive comments (": ping") that
+                        // carry no data: line.
+                        val firstBuf = ByteArrayOutputStream()
+                        var firstErr: String? = null
+                        var firstReadFailed: String? = null
+                        var gotData = false
+                        var streamEnded = false
+                        val ins = r.stream!!
+                        var attempts = 0
+                        while (attempts < 3 && !gotData && !streamEnded) {
+                            attempts++
+                            val buf = ByteArray(8192)
+                            val n = try { ins.read(buf) } catch (e: Exception) {
+                                firstReadFailed = (e.message ?: e.toString()).take(120)
+                                break
+                            }
+                            if (n < 0) { streamEnded = true; break }
+                            if (n == 0) continue
+                            firstBuf.write(buf, 0, n)
+                            val chunkText = String(firstBuf.toByteArray(), Charsets.ISO_8859_1)
+                            if (chunkText.contains("data:") || chunkText.trim().startsWith("{")) gotData = true
+                        }
+                        if (firstReadFailed == null && firstBuf.size() > 0) {
+                            firstErr = errorFromSseText(String(firstBuf.toByteArray(), Charsets.ISO_8859_1))
+                        }
+                        val dt2 = System.currentTimeMillis() - t0
+                        if (firstReadFailed != null || firstErr != null ||
+                            (streamEnded && firstBuf.size() == 0)) {
+                            // Failure, not a reply: log it as failed
+                            // (status 0, like the Test probe does for
+                            // a 200-with-error) and try the next model.
+                            lastErr = (firstErr ?: firstReadFailed ?: "empty reply").take(300)
+                            lastCode = 200
+                            Store.addLog(LogEntry(System.currentTimeMillis(), pname, m, 0, dt2, lastErr))
+                            Store.bumpModel(key, false, dt2, lastErr, permanentFail = true)
+                            if (firstErr != null && isQuotaLikeError(firstErr)) Store.markCooldown(key)
+                            try { r.close() } catch (e: Exception) {}
+                            continue
+                        }
                         val head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n" +
                             "Cache-Control: no-cache\r\nConnection: close\r\n\r\n"
                         out.write(head.toByteArray(Charsets.ISO_8859_1))
+                        out.write(firstBuf.toByteArray())
                         out.flush()
                         // finally closes the provider stream even if the
                         // client disconnects mid-stream, so the pooled
                         // provider connection is released (same leak as
                         // the non-streaming path used to have).
                         var tokens = 0
+                        if (chunkHasUsage(firstBuf.toByteArray(), firstBuf.size())) {
+                            tokens = parseStreamUsage(firstBuf.toByteArray(), firstBuf.size())
+                        }
                         try {
-                            val ins = r.stream!!
                             val buf = ByteArray(8192)
                             while (true) {
                                 val n = try { ins.read(buf) } catch (e: Exception) { break }
@@ -318,11 +434,26 @@ class HttpServer(private val port: Int) {
                             r.close()
                         }
                         if (tokens > 0) Store.addTokens(key, tokens)
-                        Store.addLog(LogEntry(System.currentTimeMillis(), pname, m, r.status, dt, "", tokens))
-                        Store.bumpModel(key, true, dt, "")
+                        Store.addLog(LogEntry(System.currentTimeMillis(), pname, m, r.status, dt2, "", tokens))
+                        Store.bumpModel(key, true, dt2, "")
                     } else {
                         val body = r.body ?: ByteArray(0)
-                        val tokens = parseUsageTokens(String(body, Charsets.UTF_8))
+                        val bodyText = String(body, Charsets.UTF_8)
+                        // 200 with an error object, or with no usable
+                        // content, is a failure (same rule as the Test
+                        // probe) — fall through to the next model.
+                        val errText = errorFromJsonBody(bodyText)
+                        val failReason = errText ?: if (isEmptyReply(bodyText)) "empty reply" else null
+                        if (failReason != null) {
+                            lastErr = failReason.take(300)
+                            lastCode = r.status
+                            Store.addLog(LogEntry(System.currentTimeMillis(), pname, m, 0, dt, lastErr))
+                            Store.bumpModel(key, false, dt, lastErr, permanentFail = true)
+                            if (errText != null && isQuotaLikeError(errText)) Store.markCooldown(key)
+                            r.close()
+                            continue
+                        }
+                        val tokens = parseUsageTokens(bodyText)
                         if (tokens > 0) Store.addTokens(key, tokens)
                         Store.addLog(LogEntry(System.currentTimeMillis(), pname, m, r.status, dt, "", tokens))
                         Store.bumpModel(key, true, dt, "")
