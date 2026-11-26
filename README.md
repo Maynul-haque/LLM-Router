@@ -142,3 +142,7 @@ kotlinc -jvm-target 17 -include-runtime -cp android.jar \
 - v0.4.0: combos exposed on `/v1/models`, request routing by combo name.
 - The server listens on loopback only; nothing leaves the device except calls to the providers you added.
 - API keys are stored on the device in the app's config. Keep your config backup private.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
