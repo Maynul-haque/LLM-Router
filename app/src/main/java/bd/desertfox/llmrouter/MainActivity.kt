@@ -13,6 +13,8 @@ import android.os.Build
 import android.os.Bundle
 import android.text.Editable
 import android.text.TextWatcher
+import android.view.GestureDetector
+import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
 import android.widget.AbsListView
@@ -84,22 +86,61 @@ class MainActivity : Activity() {
     private lateinit var modelsRow: LinearLayout
     private lateinit var drawer: LinearLayout
     private lateinit var scrim: View
-    private lateinit var drawerServer: TextView
+    private lateinit var drawerAutoTest: TextView
     private var drawerShown = false
+    // Log dialog filter state, kept across opens.
+    private var logFailedOnly = false
+    private var logFilterText = ""
     private val tabs = ArrayList<LinearLayout>()
     private val tabBars = ArrayList<View>()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         installCrashCatcher()
-        Store.load(applicationContext)
-        if (Build.VERSION.SDK_INT >= 33 &&
-            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
-            requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
+        try {
+            Store.ensureLoaded(applicationContext)
+            // Left/right swipe anywhere switches Providers / Models /
+            // Combos. Horizontal fling only, so vertical scrolling
+            // is untouched; ignored while the drawer is open.
+            // Observed in dispatchTouchEvent (not consumed) so
+            // lists, rows and search boxes keep working as before.
+            tabSwipe = GestureDetector(this, object : GestureDetector.SimpleOnGestureListener() {
+                override fun onFling(e1: MotionEvent?, e2: MotionEvent, vx: Float, vy: Float): Boolean {
+                    if (e1 == null || drawerShown) return false
+                    val dx = e2.x - e1.x
+                    if (Math.abs(dx) < dp(80).toFloat() || Math.abs(dx) < Math.abs(e2.y - e1.y) * 1.5f) return false
+                    if (dx < 0 && curTab < 2) showTab(curTab + 1)
+                    else if (dx > 0 && curTab > 0) showTab(curTab - 1)
+                    return true
+                }
+            })
+            if (Build.VERSION.SDK_INT >= 33 &&
+                checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+                requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
+            }
+            setContentView(buildUi())
+            showTab(0)
+            showLastCrashIfAny()
+        } catch (e: Throwable) {
+            // Never die on launch without saying why: show the
+            // error on a plain screen the user can copy from and
+            // send in. (The crash catcher also saved it to
+            // crash_last.txt, but that dialog can never appear
+            // when the app dies before the UI exists.)
+            try {
+                java.io.File(filesDir, "crash_last.txt").writeText(
+                    java.text.SimpleDateFormat("MM-dd HH:mm", java.util.Locale.US).format(java.util.Date()) + "\n" +
+                        e.stackTraceToString().take(2500))
+            } catch (ignored: Exception) {}
+            val tv = TextView(this)
+            tv.text = "LLM Router could not start.\n\nLong-press to copy this text and send it to the developer:\n\n" +
+                e.stackTraceToString().take(2000)
+            tv.setTextIsSelectable(true)
+            tv.setTextColor(TXT)
+            tv.textSize = 13f
+            tv.setPadding(dp(16), dp(16), dp(16), dp(16))
+            setContentView(tv)
         }
-        setContentView(buildUi())
-        showTab(0)
-        showLastCrashIfAny()
     }
 
     private fun installCrashCatcher() {
@@ -437,9 +478,6 @@ class MainActivity : Activity() {
         cRow.addView(space(dp(8)))
         cRow.addView(textBtn("Deactivate") { Store.clearActive(); refresh() },
             LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-        cRow.addView(space(dp(8)))
-        cRow.addView(textBtn("Log") { logDialog() },
-            LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         activePanel.addView(cRow)
         frame.addView(activePanel, FrameLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
@@ -468,25 +506,23 @@ class MainActivity : Activity() {
         dhead.setPadding(dp(18), dp(22), dp(18), dp(2))
         drawer.addView(dhead)
         val dver = TextView(this)
-        dver.text = "v0.5.0"
+        dver.text = "v0.5.9"
         dver.textSize = 12f
         dver.setTextColor(DIM)
         dver.setPadding(dp(18), 0, dp(18), dp(10))
         drawer.addView(dver)
         drawer.addView(dDivider())
-        drawerServer = TextView(this)
-        drawerServer.textSize = 15f
-        drawerServer.setTextColor(TXT)
-        drawerServer.setPadding(dp(18), dp(14), dp(18), dp(14))
-        drawerServer.isClickable = true
-        drawerServer.setOnClickListener { toggleServer() }
-        drawer.addView(drawerServer)
-        drawer.addView(dDivider())
         drawer.addView(dItem("Import keys (keys.json)") { pickImport() })
-        drawer.addView(dItem("Fetch all models") { fetchModels() })
         drawer.addView(dItem("Backup config") { backupConfig() })
         drawer.addView(dDivider())
-        drawer.addView(dItem("About / server info") { aboutDialog() })
+        drawer.addView(dItem("Request log") { logDialog() })
+        drawer.addView(dItem("Change port\u2026") { portDialog() })
+        drawerAutoTest = dItem(autoTestLabel()) { toggleAutoTest() }
+        drawer.addView(drawerAutoTest)
+        drawer.addView(dDivider())
+        drawer.addView(dItem("How to use") { howToDialog() })
+        drawer.addView(dItem("About") { aboutDialog() })
+        drawer.addView(dItem("Server info") { serverDialog() })
         drawer.visibility = View.GONE
         rootFrame.addView(drawer, FrameLayout.LayoutParams(dp(272), ViewGroup.LayoutParams.MATCH_PARENT))
 
@@ -524,6 +560,64 @@ class MainActivity : Activity() {
             startForegroundService(Intent(this, RouterService::class.java))
         }
         serverPill.postDelayed({ refresh() }, 500)
+    }
+
+    // ---- drawer actions: port, auto-test ----
+
+    private fun autoTestLabel(): String =
+        "Auto-test new models: " + if (Store.cfg.optBoolean("autoTestNew", false)) "ON" else "OFF"
+
+    private fun toggleAutoTest() {
+        val on = !Store.cfg.optBoolean("autoTestNew", false)
+        Store.cfg.put("autoTestNew", on)
+        Store.save()
+        Toast.makeText(this, if (on) "New models will be tested automatically after a fetch"
+            else "Auto-test off — use \"Test new models\" instead", Toast.LENGTH_LONG).show()
+        refresh()
+    }
+
+    // Change the server port from the UI. The running server is
+    // restarted on the new port (stop, brief pause so the old socket
+    // is released, start); the base URL in your app must be updated
+    // to match, so the toast says so.
+    private fun portDialog() {
+        val box = EditText(this)
+        box.inputType = android.text.InputType.TYPE_CLASS_NUMBER
+        box.setText("" + Store.cfg.optInt("port", 8790))
+        box.hint = "1024 - 65535"
+        AlertDialog.Builder(this).setTitle("Server port").setView(box)
+            .setPositiveButton("Save") { _, _ ->
+                val p = box.text.toString().trim().toIntOrNull()
+                if (p == null || p < 1024 || p > 65535) {
+                    Toast.makeText(this, "Port must be 1024-65535", Toast.LENGTH_SHORT).show()
+                    return@setPositiveButton
+                }
+                Store.cfg.put("port", p)
+                Store.save()
+                if (HttpServerHolder.running) {
+                    stopService(Intent(this, RouterService::class.java))
+                    serverPill.postDelayed({
+                        startForegroundService(Intent(this, RouterService::class.java))
+                        serverPill.postDelayed({ refresh() }, 500)
+                    }, 600)
+                } else refresh()
+                Toast.makeText(this, "Port set to " + p + " — update the base URL in your app",
+                    Toast.LENGTH_LONG).show()
+            }
+            .setNegativeButton("Cancel", null).show()
+    }
+
+    // After a fetch/refresh, test the newly added models right away
+    // when the auto-test toggle is on. If a batch is already running,
+    // leave the pending set alone — the "Test new models" button
+    // stays, instead of losing the list.
+    private fun maybeAutoTestNew() {
+        if (!Store.cfg.optBoolean("autoTestNew", false)) return
+        if (pendingNewTestKeys.isEmpty()) return
+        if (testing) return
+        val keys = ArrayList(pendingNewTestKeys)
+        pendingNewTestKeys.clear()
+        testBatch(keys)
     }
 
     // ================= adapters =================
@@ -675,7 +769,12 @@ class MainActivity : Activity() {
             head.addView(t, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
             val chip = TextView(this@MainActivity)
             val enabled = m.optBoolean("enabled", true)
+            // Hidden models show a "hidden" chip (they only appear when
+            // Hide failed is off); a 429-cooled model shows "cooldown"
+            // so it is clear why the router skips it for the next minute.
             val (label, col) = when {
+                m.optBoolean("hidden", false) -> Pair("hidden", DIM)
+                Store.isCooledDown(key) -> Pair("cooldown", DIM)
                 !enabled -> Pair("disabled", DIM)
                 m.has("lastOk") && m.optBoolean("lastOk") -> Pair("" + m.optLong("lastLatencyMs") + "ms", ACCENT)
                 m.has("lastOk") -> Pair("fail", RED)
@@ -720,6 +819,15 @@ class MainActivity : Activity() {
         refresh()
     }
 
+    // Swipe detector, created in onCreate (not as a field
+    // initializer) so nothing runs before the activity exists.
+    private var tabSwipe: GestureDetector? = null
+
+    override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
+        tabSwipe?.onTouchEvent(ev)
+        return super.dispatchTouchEvent(ev)
+    }
+
     // ================= model keys + search =================
 
     private fun sortedModelKeys(): List<String> {
@@ -730,6 +838,7 @@ class MainActivity : Activity() {
             val key = m.optString("provider") + "|" + m.optString("id")
             val enabled = m.optBoolean("enabled", true)
             val rank = when {
+                m.optBoolean("hidden", false) -> 3
                 !enabled -> 3
                 m.has("lastOk") && m.optBoolean("lastOk") -> 0
                 m.has("lastOk") -> 2
@@ -750,6 +859,7 @@ class MainActivity : Activity() {
     // and the combo selector excludes them. Any of those means
     // RikkaHub can't use it.
     private fun isUnusable(m: JSONObject): Boolean {
+        if (m.optBoolean("hidden", false)) return true
         if (!m.optBoolean("enabled", true)) return true
         if (m.optBoolean("paid", false)) return true
         val p = Store.providerByName(m.optString("provider"))
@@ -792,7 +902,10 @@ class MainActivity : Activity() {
         modelsRow.removeAllViews()
         if (selectMode) {
             val n = selected.size
-            modelsRow.addView(textBtn("Activate " + n) { activateSelected() },
+            // One model selected = activate it as a single model (a
+            // one-model combo would be pointless); two or more = the
+            // button makes a combo and activates it.
+            modelsRow.addView(textBtn(if (n == 1) "Activate" else "Activate " + n) { activateSelected() },
                 LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
             modelsRow.addView(space(dp(8)))
             modelsRow.addView(textBtn("Test sel") { testBatch(ArrayList(selected)) },
@@ -829,9 +942,6 @@ class MainActivity : Activity() {
             modelsRow.addView(space(dp(8)))
             modelsRow.addView(textBtn("Select") { selectMode = true; selected.clear(); refresh() },
                 LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-            modelsRow.addView(space(dp(8)))
-            modelsRow.addView(textBtn("Log") { logDialog() },
-                LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         }
     }
 
@@ -857,6 +967,10 @@ class MainActivity : Activity() {
 
     private fun refresh() {
         sortedKeysDirty = true
+        // Keep the single auto-managed "auto-best" combo in sync
+        // with the models (diff-guarded inside, so this is cheap
+        // in steady state).
+        Store.rebuildAutoBest()
         provCounts.clear()
         val ps = Store.providers()
         val msAll = Store.models()
@@ -873,8 +987,8 @@ class MainActivity : Activity() {
         serverPill.text = if (on) "ON" else "OFF"
         serverPill.background = cardBg(if (on) 0xFF1F3D33.toInt() else PILL_OFF)
         serverPill.setTextColor(if (on) ACCENT else DIM)
-        if (this::drawerServer.isInitialized) {
-            drawerServer.text = if (on) "Server: ON" else "Server: OFF"
+        if (this::drawerAutoTest.isInitialized) {
+            drawerAutoTest.text = autoTestLabel()
         }
         statusLine.text = "http://127.0.0.1:" + Store.cfg.optInt("port", 8790) + "/v1  \u00b7  " +
             ps.length() + " providers \u00b7 " + modelKeys.size + " models \u00b7 " + Store.combos().length() + " combos"
@@ -945,7 +1059,17 @@ class MainActivity : Activity() {
             t.typeface = mediumTypeface
             head.addView(t, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
             val chip = TextView(this)
-            chip.text = if (active) "ACTIVE \u00b7 " + ids.length() else "" + ids.length() + " models"
+            // Combo health: how many of its models are actually usable
+            // right now (passed, enabled, not hidden, not paid) out of
+            // the total — so a combo with 3 dead models out of 15
+            // reads "12/15" instead of just "15 models".
+            val total = ids.length()
+            var usable = 0
+            for (j in 0 until total) if (Store.isModelUsable(ids.optString(j))) usable++
+            val isAuto = Store.isAutoManaged(name)
+            chip.text = if (active) "ACTIVE \u00b7 " + usable + "/" + total
+                else if (isAuto) "auto \u00b7 " + usable + "/" + total + " usable"
+                else "" + usable + "/" + total + " usable"
             chip.textSize = 12f
             chip.setTextColor(if (active) 0xFF0D0D11.toInt() else DIM)
             chip.setPadding(dp(8), dp(3), dp(8), dp(3))
@@ -964,6 +1088,9 @@ class MainActivity : Activity() {
 
     private fun buildExpanded(card: LinearLayout, name: String) {
         val keys = ArrayList(Store.comboKeys(name))
+        // Auto-managed combos are read-only: rows have no
+        // reorder/remove buttons (the rebuild owns the list).
+        val readOnly = Store.isAutoManaged(name)
         val wrap = LinearLayout(this)
         wrap.orientation = LinearLayout.VERTICAL
         wrap.setPadding(0, dp(8), 0, 0)
@@ -978,12 +1105,35 @@ class MainActivity : Activity() {
             r.layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ROWH)
             val key = keys[i]
             val m = modelIndex[key]
+            // Unusable models in a combo are greyed out with the reason
+            // next to the name (same rule as the Models tab chip), so the
+            // "15/17 usable" count can be traced to the actual models.
+            // The ▲▼✕ buttons stay working, so a dead model can still
+            // be moved down or removed.
+            val usable = Store.isModelUsable(key)
+            val reason = when {
+                m == null -> "removed"
+                m.optBoolean("hidden", false) -> "hidden"
+                !m.optBoolean("enabled", true) -> "disabled"
+                m.optBoolean("paid", false) -> "paid"
+                Store.providerByName(m.optString("provider"))?.optBoolean("enabled", true) == false -> "provider off"
+                m.has("lastOk") && !m.optBoolean("lastOk") -> "fail"
+                else -> ""
+            }
             val t = TextView(this)
             t.text = if (m != null) m.optString("id") else key
             t.textSize = 14.5f
-            t.setTextColor(TXT)
+            t.setTextColor(if (usable) TXT else DIM)
             t.maxLines = 1
             r.addView(t, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+            if (reason.isNotBlank()) {
+                val st = TextView(this)
+                st.text = reason
+                st.textSize = 12f
+                st.setTextColor(if (reason == "fail") RED else DIM)
+                st.setPadding(dp(8), 0, dp(4), 0)
+                r.addView(st)
+            }
             // Reorder with visible buttons (the old drag-to-reorder kept a
             // shared mutable list + a delayed Runnable that raced refresh()
             // and crashed). Index is resolved at tap time; first row has no
@@ -998,7 +1148,7 @@ class MainActivity : Activity() {
                 val idx = keys.indexOf(key).let { if (it < 0) rIdx else it }
                 if (idx > 0 && Store.comboMove(name, idx, -1)) refresh()
             }
-            r.addView(up)
+            if (!readOnly) r.addView(up)
             val down = TextView(this)
             down.text = "\u25BC"
             down.textSize = 13f
@@ -1009,7 +1159,7 @@ class MainActivity : Activity() {
                 val idx = keys.indexOf(key).let { if (it < 0) rIdx else it }
                 if (idx >= 0 && idx < keys.size - 1 && Store.comboMove(name, idx, +1)) refresh()
             }
-            r.addView(down)
+            if (!readOnly) r.addView(down)
             val x = TextView(this)
             x.text = "\u2715"
             x.textSize = 14f
@@ -1020,7 +1170,7 @@ class MainActivity : Activity() {
                 Store.comboRemoveAt(name, keys.indexOf(key).let { if (it < 0) rIdx else it })
                 refresh()
             }
-            r.addView(x)
+            if (!readOnly) r.addView(x)
             wrap.addView(r)
         }
         card.addView(wrap)
@@ -1049,6 +1199,16 @@ class MainActivity : Activity() {
     // ================= dialogs / actions =================
 
     private fun comboMenu(name: String) {
+        // Auto-managed combos — no Add / Sort / Rename / Delete;
+        // they rebuild themselves from the models.
+        if (Store.isAutoManaged(name)) {
+            val msg = if (Store.comboByName(name)?.optBoolean("autoBest", false) == true)
+                "Auto-managed auto-best combo — models that replied successfully join automatically"
+            else
+                "Auto-managed alias combo — same model from all providers, rebuilt automatically"
+            Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
+            return
+        }
         val opts = arrayOf("Add models", "Sort speed", "Rename", "Delete")
         AlertDialog.Builder(this)
             .setTitle(name)
@@ -1259,24 +1419,33 @@ class MainActivity : Activity() {
             .show()
     }
 
+    // Long-press on any model. One rule for single vs multi:
+    // "Activate" here activates this one model immediately — no select
+    // mode needed. "Select" opens select mode with this model already
+    // ticked, for picking several models (Activate N / Test sel).
+    // "Hide this model" hides just this model (it stays out of the
+    // list, combos and /v1/models until shown again); the global
+    // Hide-failed toggle lives only in the bottom button row, not here.
     private fun modelLongPress(key: String) {
         val m = Store.findModel(key) ?: return
         val enabled = m.optBoolean("enabled", true)
-        val hide = Store.cfg.optBoolean("hideFailed", false)
-        val hideOpt = if (hide) "Show failed models" else "Hide all failed models"
-        val opts = if (enabled)
-            arrayOf("Activate single", "Add to combo", "Test this model", "Disable", hideOpt)
-        else arrayOf("Re-enable", "Test this model", hideOpt)
+        val hidden = m.optBoolean("hidden", false)
+        val opts = when {
+            hidden -> arrayOf("Select", "Show this model", "Test this model")
+            !enabled -> arrayOf("Select", "Re-enable", "Test this model", "Hide this model")
+            else -> arrayOf("Activate", "Select", "Add to combo", "Test this model", "Hide this model")
+        }
         AlertDialog.Builder(this)
             .setTitle(m.optString("id") + " (" + m.optString("provider") + ")")
             .setItems(opts) { _, w ->
                 when (opts[w]) {
-                    "Activate single" -> Store.setActiveSingle(m.optString("provider"), m.optString("id"))
+                    "Activate" -> Store.setActiveSingle(m.optString("provider"), m.optString("id"))
+                    "Select" -> { selectMode = true; selected.clear(); selected.add(key) }
                     "Add to combo" -> chooseComboFor(key)
                     "Test this model" -> testBatch(arrayListOf(key))
-                    "Disable" -> { m.put("enabled", false); Store.save() }
+                    "Hide this model" -> { m.put("hidden", true); Store.save() }
+                    "Show this model" -> { m.put("hidden", false); Store.save() }
                     "Re-enable" -> { m.put("enabled", true); m.put("failStreak", 0); Store.save() }
-                    hideOpt -> { Store.cfg.put("hideFailed", !hide); Store.save() }
                 }
                 refresh()
             }
@@ -1286,7 +1455,11 @@ class MainActivity : Activity() {
     private fun chooseComboFor(key: String) {
         val cs = Store.combos()
         val names = ArrayList<String>()
-        for (i in 0 until cs.length()) names.add(cs.getJSONObject(i).optString("name"))
+        for (i in 0 until cs.length()) {
+            // Auto-managed combos — never hand-add to them.
+            if (Store.isAutoManaged(cs.getJSONObject(i).optString("name"))) continue
+            names.add(cs.getJSONObject(i).optString("name"))
+        }
         val items = names.toTypedArray() + arrayOf("+ New combo\u2026")
         AlertDialog.Builder(this)
             .setTitle("Add to which combo?")
@@ -1412,6 +1585,7 @@ class MainActivity : Activity() {
                     pendingNewTestKeys = ArrayList(nk)
                 }
                 refresh()
+                maybeAutoTestNew()
             }
         }.start()
     }
@@ -1487,6 +1661,7 @@ class MainActivity : Activity() {
                 // models still need testing.
                 pendingNewTestKeys = nk
                 refresh()
+                maybeAutoTestNew()
             }
         }.start()
     }
@@ -1665,28 +1840,117 @@ class MainActivity : Activity() {
         testBatch(toTest)
     }
 
+    // Request log with a filter box, a "Failed only" toggle and a
+    // token header (grand total + the 5 heaviest models by usedTokens).
+    // Filter state is kept across opens, so reopening the log keeps
+    // the same view.
     private fun logDialog() {
-        val sb = StringBuilder()
-        val logs = synchronized(Store.log) { Store.log.takeLast(60).reversed() }
-        for (e in logs) {
-            val t = java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.US).format(java.util.Date(e.ts))
-            sb.append(t).append("  ").append(e.model).append("  ").append(e.status)
-                .append("  ").append(e.latencyMs).append("ms")
-            if (e.error.isNotBlank()) sb.append("\n   ").append(e.error.take(90))
-            sb.append("\n")
+        val wrap = LinearLayout(this)
+        wrap.orientation = LinearLayout.VERTICAL
+        val pad = dp(16)
+        wrap.setPadding(pad, dp(8), pad, 0)
+        val head = TextView(this)
+        head.textSize = 13f
+        head.setTextColor(DIM)
+        val scored = ArrayList<Pair<String, Long>>()
+        var totalTok = 0L
+        val ms = Store.models()
+        for (i in 0 until ms.length()) {
+            val m = ms.getJSONObject(i)
+            val t = m.optLong("usedTokens", 0L)
+            if (t > 0) {
+                totalTok += t
+                scored.add(Pair(m.optString("id"), t))
+            }
         }
+        scored.sortByDescending { it.second }
+        val top = scored.take(5).joinToString("\n") { "  " + it.first + ": " + it.second + " tok" }
+        head.text = "Total tokens: " + totalTok + (if (top.isBlank()) "" else "\n" + top)
+        head.setPadding(0, 0, 0, dp(8))
+        wrap.addView(head)
+        val filterBox = EditText(this)
+        filterBox.hint = "filter: provider / model / error"
+        filterBox.setText(logFilterText)
+        wrap.addView(filterBox)
+        val failedBtn = textBtn(if (logFailedOnly) "Failed only: ON" else "Failed only: OFF") {}
+        failedBtn.setPadding(0, dp(8), 0, dp(4))
+        wrap.addView(failedBtn)
+        val scroll = ScrollView(this)
+        val body = TextView(this)
+        body.textSize = 12.5f
+        body.setTextColor(TXT)
+        scroll.addView(body)
+        wrap.addView(scroll, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(360)))
+        fun render() {
+            val sb = StringBuilder()
+            val q = logFilterText.lowercase()
+            val logs = synchronized(Store.log) { Store.log.takeLast(60).reversed() }
+            var shown = 0
+            for (e in logs) {
+                val isFail = e.status !in 200..299
+                if (logFailedOnly && !isFail) continue
+                val line = e.model + "  " + e.status + "  " + e.latencyMs + "ms" +
+                    (if (e.tokens > 0) "  " + e.tokens + " tok" else "") +
+                    (if (e.error.isNotBlank()) "\n   " + e.error.take(90) else "")
+                if (q.isNotBlank() && !(e.provider.lowercase().contains(q) ||
+                    e.model.lowercase().contains(q) || e.error.lowercase().contains(q))) continue
+                val t = java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.US).format(java.util.Date(e.ts))
+                sb.append(t).append("  ").append(line).append("\n")
+                shown++
+            }
+            body.text = if (shown == 0) "no matching requests" else sb.toString()
+        }
+        filterBox.addTextChangedListener(object : TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
+            override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
+            override fun afterTextChanged(s: Editable?) { logFilterText = s?.toString() ?: ""; render() }
+        })
+        failedBtn.setOnClickListener {
+            logFailedOnly = !logFailedOnly
+            failedBtn.text = if (logFailedOnly) "Failed only: ON" else "Failed only: OFF"
+            render()
+        }
+        render()
+        // Copy copies exactly what is on screen right now (including
+        // the active filter / Failed-only view), same clipboard pattern
+        // as the crash-log Copy button.
         AlertDialog.Builder(this).setTitle("Request log (last 60)")
-            .setMessage(if (sb.isBlank()) "empty" else sb.toString())
+            .setView(wrap)
+            .setNeutralButton("Copy") { _, _ ->
+                val txt = body.text.toString()
+                val cm = getSystemService(CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                cm.setPrimaryClip(android.content.ClipData.newPlainText("LLM Router request log", txt))
+                Toast.makeText(this, "Log copied", Toast.LENGTH_SHORT).show()
+            }
             .setPositiveButton("OK", null).show()
     }
 
     private fun aboutDialog() {
+        val msg = "LLM Router v0.5.9\n\nCreator: Maynul Haque\n\nsmall \u00b7 offline \u00b7 no tracking"
+        AlertDialog.Builder(this).setTitle("About").setMessage(msg)
+            .setPositiveButton("OK", null).show()
+    }
+
+    private fun serverDialog() {
         val ps = Store.providers()
-        val msg = "Base URL: http://127.0.0.1:" + Store.cfg.optInt("port", 8790) + "/v1\n" +
+        val msg = "Server: " + (if (HttpServerHolder.running) "ON" else "OFF") + "\n" +
+            "Base URL: http://127.0.0.1:" + Store.cfg.optInt("port", 8790) + "/v1\n" +
             "API key: any value\n\n" +
             ps.length() + " providers \u00b7 " + Store.models().length() + " models \u00b7 " +
-            Store.combos().length() + " combos\n\nLLM Router v0.5.0\nsmall \u00b7 offline \u00b7 no tracking"
-        AlertDialog.Builder(this).setTitle("About").setMessage(msg)
+            Store.combos().length() + " combos"
+        AlertDialog.Builder(this).setTitle("Server info").setMessage(msg)
+            .setPositiveButton("OK", null).show()
+    }
+
+    private fun howToDialog() {
+        val msg = "1. Add a provider: Providers tab \u2192 + Add \u2192 name, base URL, API key.\n\n" +
+            "2. Fetch models: Providers tab \u2192 Fetch all.\n\n" +
+            "3. Test: Models tab \u2192 Test all. Only models that actually reply pass.\n\n" +
+            "4. Pick a model: successful models join the auto-best combo by themselves (fastest first), or make your own combo in the Combos tab and Activate it.\n\n" +
+            "5. Start the server: tap the Server pill (or the drawer Server toggle) so it shows ON.\n\n" +
+            "6. In any OpenAI-compatible app: add a custom provider \u2014 Base URL http://127.0.0.1:" + Store.cfg.optInt("port", 8790) + "/v1, API key any value, model auto-best (or a combo name, or one model id).\n\n" +
+            "7. If a model fails or its quota runs out, the router falls back to the next one automatically. The drawer Request log shows what was tried."
+        AlertDialog.Builder(this).setTitle("How to use").setMessage(msg)
             .setPositiveButton("OK", null).show()
     }
 

@@ -13,6 +13,10 @@ class RouterService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        // The system can restart this sticky service in a fresh
+        // process (e.g. after an app update) before any activity
+        // ran — load the config first, or Store.cfg is uninitialized.
+        Store.ensureLoaded(applicationContext)
         if (Build.VERSION.SDK_INT >= 26) {
             val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
             val c = NotificationChannel("router", "LLM Router server", NotificationManager.IMPORTANCE_LOW)

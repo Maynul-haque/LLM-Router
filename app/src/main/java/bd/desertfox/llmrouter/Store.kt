@@ -9,13 +9,14 @@ import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.TimeUnit
 
 class LogEntry(val ts: Long, val provider: String, val model: String,
-               val status: Int, val latencyMs: Long, val error: String) {
+               val status: Int, val latencyMs: Long, val error: String, val tokens: Int = 0) {
     fun toJson(): JSONObject = JSONObject()
         .put("ts", ts).put("provider", provider).put("model", model)
-        .put("status", status).put("latencyMs", latencyMs).put("error", error)
+        .put("status", status).put("latencyMs", latencyMs).put("error", error).put("tokens", tokens)
     companion object {
         fun from(j: JSONObject) = LogEntry(j.optLong("ts"), j.optString("provider"),
-            j.optString("model"), j.optInt("status"), j.optLong("latencyMs"), j.optString("error"))
+            j.optString("model"), j.optInt("status"), j.optLong("latencyMs"), j.optString("error"),
+            j.optInt("tokens", 0))
     }
 }
 
@@ -26,17 +27,31 @@ object Store {
     val log = ArrayList<LogEntry>()
     const val LOG_CAP = 1000
 
+    // Load once; safe to call from the service too. The service
+    // (START_STICKY) can be restarted by the system in a fresh
+    // process — e.g. right after an app update while the server
+    // was ON — before any activity ever ran, so cfg must be
+    // loaded there as well or every Store.cfg access crashes.
+    fun ensureLoaded(ctx: Context) {
+        if (!::cfg.isInitialized) load(ctx)
+    }
+
     fun load(ctx: Context) {
         appCtx = ctx.applicationContext
         val f = File(ctx.filesDir, "config.json")
         cfg = try { if (f.exists()) JSONObject(f.readText()) else JSONObject() } catch (e: Exception) { JSONObject() }
         defaults()
         invalidateIndexes()
-        ensureAutoCombo()
+        // One auto-managed combo only: rebuildAutoBest() removes the
+        // old v0.5.2 alias combos and the preinstalled "auto" combo.
+        rebuildAutoBest()
         synchronized(log) {
             log.clear()
             val la = cfg.optJSONArray("log") ?: JSONArray()
-            for (i in 0 until la.length()) log.add(LogEntry.from(la.getJSONObject(i)))
+            for (i in 0 until la.length()) {
+                val o = la.optJSONObject(i) ?: continue
+                log.add(LogEntry.from(o))
+            }
         }
         save()
     }
@@ -47,22 +62,15 @@ object Store {
         if (!cfg.has("combos")) cfg.put("combos", JSONArray())
         if (!cfg.has("active")) cfg.put("active", JSONObject().put("type", "none"))
         if (!cfg.has("autoDisable")) cfg.put("autoDisable", true)
+        if (!cfg.has("autoTestNew")) cfg.put("autoTestNew", false)
         if (!cfg.has("port")) cfg.put("port", 8790)
     }
 
-    // Preinstalled "auto" combo: on first run (no combos yet), build one
-    // from the currently enabled chain, in its existing order, so RikkaHub
-    // users can type model "auto" and get the whole enabled set with
-    // fallback. Never touches existing combos; never created when there
-    // is nothing enabled. Persisted by load()'s existing debounced save().
-    private fun ensureAutoCombo() {
-        if (combos().length() != 0) return
-        val keys = enabledChain().map { it.first.optString("name") + "|" + it.second }
-        if (keys.isEmpty()) return
-        val ids = JSONArray()
-        for (k in keys) ids.put(k)
-        combos().put(JSONObject().put("name", "auto").put("models", ids))
-        invalidateIndexes()
+    // Auto-managed combo check: alias combos (v0.5.2, removed by the
+    // rebuild below) and the auto-best combo (v0.5.5).
+    fun isAutoManaged(n: String): Boolean {
+        val c = comboByName(n) ?: return false
+        return c.optBoolean("autoAlias", false) || c.optBoolean("autoBest", false)
     }
 
     fun save() {
@@ -157,13 +165,42 @@ object Store {
         }
     }
 
+    // Same-model rotation for alias combos: combo name -> next start
+    // index. In-memory only (like cooldowns) — rotation fairness
+    // across restarts is not important, and this avoids a disk write
+    // on every request.
+    private val rrIndex = HashMap<String, Int>()
+
+    // Rotate an alias combo's keys so each request starts at a
+    // different provider of the SAME model (safe-form round-robin:
+    // the model never changes mid-conversation, only the provider).
+    private fun rotateAlias(name: String, keys: List<String>): List<String> {
+        if (keys.size <= 1) return keys
+        val idx = synchronized(rrIndex) {
+            val i = (rrIndex[name] ?: 0) % keys.size
+            rrIndex[name] = (i + 1) % keys.size
+            i
+        }
+        return keys.subList(idx, keys.size) + keys.subList(0, idx)
+    }
+
+    // Keys of a named combo, rotated when it is an auto-managed
+    // alias combo. Custom combos are never rotated.
+    private fun comboKeysRotated(name: String): List<String> {
+        val c = comboByName(name) ?: return emptyList()
+        val ids = c.optJSONArray("models") ?: return emptyList()
+        val keys = ArrayList<String>()
+        for (i in 0 until ids.length()) keys.add(ids.optString(i))
+        return if (c.optBoolean("autoAlias", false)) rotateAlias(name, keys) else keys
+    }
+
     private fun providersByName(): HashMap<String, JSONObject> {
         var idx = providerIndex
         if (idx == null) {
             idx = HashMap()
             val ps = providers()
             for (i in 0 until ps.length()) {
-                val p = ps.getJSONObject(i)
+                val p = ps.optJSONObject(i) ?: continue
                 idx[p.optString("name")] = p
             }
             providerIndex = idx
@@ -177,7 +214,7 @@ object Store {
             idx = HashMap()
             val ms = models()
             for (i in 0 until ms.length()) {
-                val m = ms.getJSONObject(i)
+                val m = ms.optJSONObject(i) ?: continue
                 idx[m.optString("provider") + "|" + m.optString("id")] = m
             }
             modelIndex = idx
@@ -191,7 +228,7 @@ object Store {
             idx = HashMap()
             val cs = combos()
             for (i in 0 until cs.length()) {
-                val c = cs.getJSONObject(i)
+                val c = cs.optJSONObject(i) ?: continue
                 idx[c.optString("name")] = c
             }
             comboIndex = idx
@@ -262,6 +299,7 @@ object Store {
         for (i in 0 until ms.length()) {
             val m = ms.getJSONObject(i)
             val key = m.optString("provider") + "|" + m.optString("id")
+            if (m.optBoolean("hidden", false)) continue
             if (!m.optBoolean("enabled", true)) continue
             val p = providerByName(m.optString("provider")) ?: continue
             if (!p.optBoolean("enabled", true)) continue
@@ -272,6 +310,7 @@ object Store {
 
     private fun resolveKey(key: String, out: MutableList<Pair<JSONObject, String>>, skipCooled: Boolean) {
         val m = findModel(key) ?: return
+        if (m.optBoolean("hidden", false)) return
         if (!m.optBoolean("enabled", true)) return
         val p = providerByName(m.optString("provider")) ?: return
         if (!p.optBoolean("enabled", true)) return
@@ -299,10 +338,7 @@ object Store {
     // Chain for a named combo (used by /v1/chat/completions when the
     // requested model matches a combo name exposed on /v1/models).
     fun comboChain(name: String): List<Pair<JSONObject, String>> {
-        val ids = comboByName(name)?.optJSONArray("models") ?: return emptyList()
-        val keys = ArrayList<String>()
-        for (i in 0 until ids.length()) keys.add(ids.optString(i))
-        return resolveKeys(keys)
+        return resolveKeys(comboKeysRotated(name))
     }
 
     fun activeChain(): List<Pair<JSONObject, String>> {
@@ -310,12 +346,15 @@ object Store {
         val keys = ArrayList<String>()
         when (a.optString("type")) {
             "single", "combo" -> {
-                var ids = a.optJSONArray("models")
                 val name = a.optString("name", "")
                 if (a.optString("type") == "combo" && name.isNotBlank()) {
-                    ids = comboByName(name)?.optJSONArray("models")
+                    // Alias combos rotate too, so the active combo also
+                    // spreads requests across the model's providers.
+                    keys.addAll(comboKeysRotated(name))
+                } else {
+                    val ids = a.optJSONArray("models")
+                    if (ids != null) for (i in 0 until ids.length()) keys.add(ids.optString(i))
                 }
-                if (ids != null) for (i in 0 until ids.length()) keys.add(ids.optString(i))
             }
         }
         return resolveKeys(keys)
@@ -396,6 +435,10 @@ object Store {
     fun renameCombo(old: String, new: String): Boolean {
         if (new.isBlank() || (comboByName(new) != null && old != new)) return false
         val c = comboByName(old) ?: return false
+        // Renaming an alias or auto-best combo would break the rebuild
+        // (it would recreate the auto one and leave the renamed one
+        // behind as a stale custom combo).
+        if (c.optBoolean("autoAlias", false) || c.optBoolean("autoBest", false)) return false
         c.put("name", new)
         if (activeComboName() == old) cfg.getJSONObject("active").put("name", new)
         invalidateIndexes()
@@ -410,6 +453,87 @@ object Store {
         return out
     }
 
+    // ---- auto-best combo (v0.5.5) ----
+    // Replaces the v0.5.2 alias combos (one combo per model id) and the
+    // preinstalled "auto" combo. There is exactly one auto-managed
+    // combo: "auto-best". It holds every model that actually replied
+    // successfully (usable + lastOk), ordered fastest first — so a
+    // model only joins after it has really answered, and a model that
+    // starts failing leaves on the next rebuild. No rotation: the
+    // order is the fallback order (fastest first). Custom combos are
+    // never touched; a custom combo that happens to be named
+    // "auto-best" is left alone, and the old "auto" combo is removed
+    // (it was the preinstalled auto combo, not a custom one — the
+    // auto-best combo takes its place). If the active combo was one
+    // of the removed auto combos, auto-best becomes active.
+    // Diff-guarded: nothing is written when the desired state
+    // already holds, so calling this on every refresh() is cheap.
+    // Never let auto-maintenance kill the app: if the stored
+    // config has a malformed entry, record the trace for the
+    // crash dialog and leave the combos alone — the rebuild
+    // retries on the next refresh().
+    fun rebuildAutoBest() {
+        try {
+            rebuildAutoBestInner()
+        } catch (e: Exception) {
+            recordProblem(e)
+        }
+    }
+
+    private fun recordProblem(e: Exception) {
+        try {
+            val ctx = appCtx ?: return
+            java.io.File(ctx.filesDir, "crash_last.txt").writeText(
+                java.text.SimpleDateFormat("MM-dd HH:mm", java.util.Locale.US).format(java.util.Date()) + "\n" +
+                    e.stackTraceToString().take(2500))
+        } catch (ignored: Exception) {}
+    }
+
+    private fun rebuildAutoBestInner() {
+        val wasActiveAuto = activeComboName()?.let { n ->
+            n == "auto" || isAutoManaged(n)
+        } ?: false
+        // 1. Remove all alias combos and the old "auto" combo.
+        // optJSONObject: a malformed entry is skipped, never a crash.
+        val cs = combos()
+        val names = ArrayList<String>()
+        for (i in 0 until cs.length()) {
+            val c = cs.optJSONObject(i) ?: continue
+            names.add(c.optString("name"))
+        }
+        for (n in names) {
+            val c = comboByName(n) ?: continue
+            if (c.optBoolean("autoAlias", false) || n == "auto") removeCombo(n)
+        }
+        // 2. Desired members: usable models that actually replied.
+        val rows = ArrayList<Pair<String, Long>>()
+        val ms = models()
+        for (i in 0 until ms.length()) {
+            val m = ms.optJSONObject(i) ?: continue
+            val key = m.optString("provider") + "|" + m.optString("id")
+            if (!isModelUsable(key)) continue
+            if (!m.optBoolean("lastOk", false)) continue
+            rows.add(Pair(key, m.optLong("lastLatencyMs", Long.MAX_VALUE)))
+        }
+        val desired = rows.sortedBy { it.second }.map { it.first }
+        // 3. Create or update auto-best.
+        val c = comboByName("auto-best")
+        if (c == null) {
+            if (addCombo("auto-best")) {
+                comboByName("auto-best")?.put("autoBest", true)
+                comboSet("auto-best", desired)
+                save()
+            }
+        } else if (c.optBoolean("autoBest", false)) {
+            if (comboKeys("auto-best") != desired) comboSet("auto-best", desired)
+        }
+        // else: a custom combo owns this name — leave it alone.
+        // 4. Keep something active if the active combo was removed.
+        if (wasActiveAuto && comboByName("auto-best")?.optBoolean("autoBest", false) == true) {
+            activateCombo("auto-best")
+        }
+    }
+
     /** Usable = the model can actually be used at runtime: it exists,
      *  is enabled, its provider exists and is enabled, and it did not
      *  fail its last test. Same rule as the Models tab's Hide failed
@@ -417,6 +541,7 @@ object Store {
      *  combos on every add path, not just the Add-models dialog. */
     fun isModelUsable(key: String): Boolean {
         val m = findModel(key) ?: return false
+        if (m.optBoolean("hidden", false)) return false
         if (!m.optBoolean("enabled", true)) return false
         if (m.optBoolean("paid", false)) return false
         val p = providerByName(m.optString("provider")) ?: return false
@@ -426,6 +551,11 @@ object Store {
 
     fun comboAddModel(n: String, key: String): Boolean {
         val c = comboByName(n) ?: return false
+        // Alias and auto-best combos are auto-managed — hand-adding a
+        // model would be overwritten by the next rebuild, so refuse
+        // it here (covers the dialog and the long-press "Add to combo"
+        // path).
+        if (c.optBoolean("autoAlias", false) || c.optBoolean("autoBest", false)) return false
         if (!isModelUsable(key)) return false
         val ids = c.optJSONArray("models") ?: JSONArray().also { c.put("models", it) }
         for (i in 0 until ids.length()) if (ids.optString(i) == key) return false
@@ -527,6 +657,11 @@ object Store {
     // actually carries pricing — absence of pricing must not clear a
     // paid flag set by an earlier response.
     fun refreshProviderModels(providerName: String, fresh: List<ProviderClient.ModelInfo>): Triple<Int, Int, List<String>> {
+        // Empty list = the provider answered but listed nothing (outage,
+        // key problem, half-broken relay). Keep the stored models instead
+        // of wiping them: a refresh must never delete everything on a
+        // bad day. The user can still remove models by hand.
+        if (fresh.isEmpty()) return Triple(0, 0, emptyList())
         val ms = models()
         val byId = fresh.associateBy { it.id }
         val keepIds = byId.keys
@@ -566,6 +701,16 @@ object Store {
     // ---- log + results ----
     fun addLog(e: LogEntry) {
         synchronized(log) { log.add(e); while (log.size > LOG_CAP) log.removeAt(0) }
+        save()
+    }
+
+    // Total tokens used by one model, summed over every served request
+    // (see HttpServer usage parsing). Stored on the model itself, so it
+    // survives restarts; the debounced save() keeps the write cheap.
+    fun addTokens(key: String, n: Int) {
+        if (n <= 0) return
+        val m = findModel(key) ?: return
+        m.put("usedTokens", m.optLong("usedTokens", 0L) + n)
         save()
     }
 
