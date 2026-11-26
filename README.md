@@ -9,6 +9,13 @@ single provider. Behind that one address, the router tries your models in order
 and falls back automatically when one fails, runs out of credits, or gets
 rate-limited. Everything runs on the device: no account, no cloud, no tracking.
 
+## Screenshots
+
+| Providers | Models | Combos |
+| :--: | :--: | :--: |
+| <img src="screenshots/providers.png" width="250" alt="Providers tab"> | <img src="screenshots/models.png" width="250" alt="Models tab"> | <img src="screenshots/combos.png" width="250" alt="Combos tab"> |
+| Add any OpenAI-compatible provider and fetch its models. | Test every model, see latency, hide failed or slow ones. | auto-best stays active with every model that actually replied. |
+
 ## What it does
 
 - **Providers** — add any OpenAI-compatible provider with a base URL and API
